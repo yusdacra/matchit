@@ -2,15 +2,16 @@ use crate::{InsertError, MatchError, Params};
 
 use std::cell::UnsafeCell;
 use std::cmp::min;
+use std::convert::TryInto;
 use std::mem;
 use std::str;
 
 /// A successful match consisting of the registered value and the URL parameters, returned by
 /// [`Node::at`](crate::Node::at).
 #[derive(Debug)]
-pub struct Match<'k, 'v, V> {
+pub struct Match<'k, 'v, T> {
     /// The value stored under the matched node.
-    pub value: V,
+    pub value: T,
     /// The route parameters. See [parameters](crate#parameters) for more details.
     pub params: Params<'k, 'v>,
 }
@@ -92,7 +93,6 @@ impl<T> Node<T> {
         self.insert_helper(route.as_bytes(), &route, val)
     }
 
-    #[inline]
     fn insert_helper(&mut self, mut prefix: &[u8], route: &str, val: T) -> Result<(), InsertError> {
         // Find the longest common prefix.
         // This also implies that the common prefix contains no ':' or '*'
@@ -198,7 +198,6 @@ impl<T> Node<T> {
         new_pos
     }
 
-    #[inline]
     fn wild_child_conflict(
         &mut self,
         prefix: &[u8],
@@ -312,7 +311,7 @@ impl<T> Node<T> {
 
         self.path = prefix[..wildcard_index].to_owned();
         self.children = vec![child];
-        self.indices = vec![b'/'];
+        self.indices = b"/".to_vec();
         self.children[0].priority += 1;
 
         // Second node: node holding the variable
@@ -374,7 +373,6 @@ impl<T> Node<T> {
     // It's a bit sad that we have to introduce unsafe here, but rust doesn't really have a way
     // to abstract over mutability, so it avoids having to duplicate logic between `at` and
     // `at_mut`.
-    #[inline(always)]
     fn at_inner<'n, 'p>(
         &'n self,
         path: &'p [u8],
@@ -513,7 +511,7 @@ impl<T> Node<T> {
         fix_trailing_slash: bool,
     ) -> Option<String> {
         let path = path.as_ref();
-        let mut insensitive_path = Vec::with_capacity(path.len() + 1);
+        let mut insensitive_path = Vec::with_capacity(128.max(path.len() + 1));
         let found = self.path_ignore_case_helper(
             path.as_bytes(),
             &mut insensitive_path,
@@ -534,59 +532,73 @@ impl<T> Node<T> {
         mut buf: [u8; 4],
         fix_trailing_slash: bool,
     ) -> bool {
-        let lower_path: &[u8] = &path.to_ascii_lowercase();
-        if lower_path.len() >= self.path.len()
-            && (self.path.is_empty()
-                || lower_path[1..self.path.len()].eq_ignore_ascii_case(&self.path[1..]))
-        {
-            insensitive_path.extend_from_slice(&self.path);
+        let mut current = self;
+        let mut path_len = current.path.len();
 
-            path = &path[self.path.len()..];
+        'walk: while path.len() >= path_len
+            && (path_len == 0
+                // TODO: unicase eq
+                || path[1..path_len].eq_ignore_ascii_case(&current.path[1..]))
+        {
+            let old_path = path;
+            path = &path[path_len..];
+            insensitive_path.extend_from_slice(&current.path);
 
             if !path.is_empty() {
-                let cached_lower_path = <&[u8]>::clone(&lower_path);
-
                 // If this node does not have a wildcard (param or catchAll) child,
                 // we can just look up the next child node and continue to walk down
                 // the tree
-                if !self.wild_child {
+                if !current.wild_child {
                     // skip char bytes already processed
-                    buf = shift_n_bytes(buf, self.path.len());
+                    buf = shift_n_bytes(buf, path_len);
 
-                    if buf[0] == 0 {
+                    if buf[0] != 0 {
+                        // old char not finished
+                        for i in 0..current.indices.len() {
+                            if current.indices[i] == buf[0] {
+                                // continue with child node
+                                current = &current.children[i];
+                                path_len = current.path.len();
+                                continue 'walk;
+                            }
+                        }
+                    } else {
                         // process a new char
-                        let mut current_char = 0 as char;
+                        let mut current_char = char::default();
 
                         // find char start
                         // chars are up to 4 byte long,
                         // -4 would definitely be another char
                         let mut off = 0;
-                        for j in 0..min(self.path.len(), 3) {
-                            let i = self.path.len() - j;
-                            if char_start(cached_lower_path[i]) {
+                        let max = min(path_len, 3);
+                        while off < max {
+                            let i = path_len - off;
+                            if char_start(old_path[i]) {
                                 // read char from cached path
-                                current_char = str::from_utf8(&cached_lower_path[i..])
+                                // we just checked this is the start of a char, so this could be
+                                // unsafe from_u32_unchecked
+                                current_char = unicode::next_code_point(&mut old_path[i..].iter())
                                     .unwrap()
-                                    .chars()
-                                    .next()
+                                    .try_into()
                                     .unwrap();
-                                off = j;
                                 break;
                             }
+                            off += 1;
                         }
 
-                        current_char.encode_utf8(&mut buf);
+                        // Calculate lowercase bytes of current rune
+                        current_char.to_ascii_lowercase().encode_utf8(&mut buf);
 
                         // skip already processed bytes
                         buf = shift_n_bytes(buf, off);
 
-                        for i in 0..self.indices.len() {
+                        for i in 0..current.indices.len() {
                             // lowercase matches
-                            if self.indices[i] == buf[0] {
+                            if current.indices[i] == buf[0] {
                                 // must use a recursive approach since both the
                                 // uppercase byte and the lowercase byte might exist
                                 // as an index
-                                if self.children[i].path_ignore_case_helper(
+                                if current.children[i].path_ignore_case_helper(
                                     path,
                                     insensitive_path,
                                     buf,
@@ -595,75 +607,98 @@ impl<T> Node<T> {
                                     return true;
                                 }
 
-                                if insensitive_path.len() > self.children[i].path.len() {
-                                    let prev_len =
-                                        insensitive_path.len() - self.children[i].path.len();
-                                    insensitive_path.truncate(prev_len);
-                                }
-
                                 break;
                             }
                         }
 
                         // same for uppercase char, if it differs
-                        let up = current_char.to_ascii_uppercase();
-                        if up != current_char {
-                            up.encode_utf8(&mut buf);
+                        let upper = current_char.to_uppercase().next();
+                        if upper != Some(current_char) {
+                            // TODO: if let Some
+                            upper.unwrap().encode_utf8(&mut buf);
                             buf = shift_n_bytes(buf, off);
 
-                            for i in 0..self.indices.len() {
-                                if self.indices[i] == buf[0] {
-                                    return self.children[i].path_ignore_case_helper(
-                                        path,
-                                        insensitive_path,
-                                        buf,
-                                        fix_trailing_slash,
-                                    );
+                            for i in 0..current.indices.len() {
+                                if current.indices[i] == buf[0] {
+                                    // continue with child node
+                                    current = &current.children[i];
+                                    path_len = current.path.len();
+                                    continue 'walk;
                                 }
-                            }
-                        }
-                    } else {
-                        // old char not finished
-                        for i in 0..self.indices.len() {
-                            if self.indices[i] == buf[0] {
-                                // continue with child node
-                                return self.children[i].path_ignore_case_helper(
-                                    path,
-                                    insensitive_path,
-                                    buf,
-                                    fix_trailing_slash,
-                                );
                             }
                         }
                     }
 
                     // Nothing found. We can recommend to redirect to the same URL
                     // without a trailing slash if a leaf exists for that path
-                    return fix_trailing_slash && path == [b'/'] && self.value.is_some();
+                    return fix_trailing_slash && path == b"/" && current.value.is_some();
                 }
 
-                return self.children[0].path_ignore_case_match_helper(
-                    path,
-                    insensitive_path,
-                    buf,
-                    fix_trailing_slash,
-                );
+                current = &current.children[0];
+                match self.node_type {
+                    NodeType::Param => {
+                        let mut end = 0;
+
+                        while end < path.len() && path[end] != b'/' {
+                            end += 1;
+                        }
+
+                        // Add param value to case insensitive path
+                        insensitive_path.extend_from_slice(&path[..end]);
+
+                        // We need to go deeper!
+                        if end < path.len() {
+                            if !current.children.is_empty() {
+                                current = &current.children[0];
+                                path_len = current.path.len();
+                                path = &path[end..];
+                                continue;
+                            }
+
+                            // ... but we can't
+                            if fix_trailing_slash && path.len() == end + 1 {
+                                return true;
+                            }
+                            return false;
+                        }
+
+                        if current.value.is_some() {
+                            return true;
+                        } else if fix_trailing_slash && current.children.len() == 1 {
+                            // No value found. Check if a value for this path + a
+                            // trailing slash exists
+                            current = &current.children[0];
+
+                            if current.path == b"/" && current.value.is_some() {
+                                insensitive_path.push(b'/');
+                                return true;
+                            }
+                        }
+
+                        return false;
+                    }
+                    NodeType::CatchAll => {
+                        insensitive_path.extend_from_slice(path);
+                        return true;
+                    }
+                    _ => unreachable!(),
+                }
             } else {
                 // We should have reached the node containing the value.
                 // Check if this node has a value registered.
-                if self.value.is_some() {
+                if current.value.is_some() {
                     return true;
                 }
 
                 // No value found.
                 // Try to fix the path by adding a trailing slash
                 if fix_trailing_slash {
-                    for i in 0..self.indices.len() {
-                        if self.indices[i] == b'/' {
-                            if (self.children[i].path.len() == 1
-                                && self.children[i].value.is_some())
-                                || (self.children[i].node_type == NodeType::CatchAll
-                                    && self.children[i].children[0].value.is_some())
+                    for i in 0..current.indices.len() {
+                        if current.indices[i] == b'/' {
+                            current = &current.children[0];
+                            if (current.path.len() == 1 && current.value.is_some())
+                                || (current.node_type == NodeType::CatchAll
+                                    && current.children[0].value.is_some())
                             {
                                 insensitive_path.push(b'/');
                                 return true;
@@ -679,15 +714,16 @@ impl<T> Node<T> {
         // Nothing found.
         // Try to fix the path by adding / removing a trailing slash
         if fix_trailing_slash {
-            if path == [b'/'] {
+            if path == b"/" {
                 return true;
             }
-            if lower_path.len() + 1 == self.path.len()
-                && self.path[lower_path.len()] == b'/'
-                && lower_path[1..].eq_ignore_ascii_case(&self.path[1..lower_path.len()])
-                && self.value.is_some()
+            if path.len() + 1 == path_len 
+                && current.path[path.len()] == b'/'
+                // TODO: unicase eq
+                && path[1..].eq_ignore_ascii_case(&current.path[1..path.len()])
+                && current.value.is_some()
             {
-                insensitive_path.extend_from_slice(&self.path);
+                insensitive_path.extend_from_slice(&current.path);
                 return true;
             }
         }
@@ -695,64 +731,14 @@ impl<T> Node<T> {
         false
     }
 
-    fn path_ignore_case_match_helper(
-        &self,
-        mut path: &[u8],
-        insensitive_path: &mut Vec<u8>,
-        buf: [u8; 4],
-        fix_trailing_slash: bool,
-    ) -> bool {
-        match self.node_type {
-            NodeType::Param => {
-                let mut end = 0;
-
-                while end < path.len() && path[end] != b'/' {
-                    end += 1;
-                }
-
-                insensitive_path.extend_from_slice(&path[..end]);
-
-                if end < path.len() {
-                    if !self.children.is_empty() {
-                        path = &path[end..];
-
-                        return self.children[0].path_ignore_case_helper(
-                            path,
-                            insensitive_path,
-                            buf,
-                            fix_trailing_slash,
-                        );
-                    }
-
-                    // ... but we can't
-                    if fix_trailing_slash && path.len() == end + 1 {
-                        return true;
-                    }
-                    return false;
-                }
-
-                if self.value.is_some() {
-                    return true;
-                } else if fix_trailing_slash
-                    && self.children.len() == 1
-                    && self.children[0].path == [b'/']
-                    && self.children[0].value.is_some()
-                {
-                    // No value found. Check if a value for this path + a
-                    // trailing slash exists
-                    insensitive_path.push(b'/');
-                    return true;
-                }
-
-                false
-            }
-            NodeType::CatchAll => {
-                insensitive_path.extend_from_slice(path);
-                true
-            }
-            _ => unreachable!(),
-        }
-    }
+    //fn path_ignore_case_match_helper(
+    //    &self,
+    //    mut path: &[u8],
+    //    insensitive_path: &mut Vec<u8>,
+    //    buf: [u8; 4],
+    //    fix_trailing_slash: bool,
+    //) -> bool {
+    //}
 }
 
 // Shift bytes in array by n bytes left
@@ -793,6 +779,62 @@ fn find_wildcard(path: &[u8]) -> (Option<&[u8]>, Option<usize>, bool) {
         return (Some(&path[start..]), Some(start), valid);
     }
     (None, None, false)
+}
+
+mod unicode {
+    /// Mask of the value bits of a continuation byte.
+    const CONT_MASK: u8 = 0b0011_1111;
+
+    fn utf8_first_byte(byte: u8, width: u32) -> u32 {
+        (byte & (0x7F >> width)) as u32
+    }
+
+    /// Returns the value of `ch` updated with continuation byte `byte`.
+    #[inline]
+    fn utf8_acc_cont_byte(ch: u32, byte: u8) -> u32 {
+        (ch << 6) | (byte & CONT_MASK) as u32
+    }
+
+    #[inline]
+    fn unwrap_or_0(opt: Option<&u8>) -> u8 {
+        match opt {
+            Some(&byte) => byte,
+            None => 0,
+        }
+    }
+
+    /// Reads the next code point out of a byte iterator (assuming a
+    /// UTF-8-like encoding).
+    #[inline]
+    pub fn next_code_point<'a, I: Iterator<Item = &'a u8>>(bytes: &mut I) -> Option<u32> {
+        // Decode UTF-8
+        let x = *bytes.next()?;
+        if x < 128 {
+            return Some(x as u32);
+        }
+
+        // Multibyte case follows
+        // Decode from a byte combination out of: [[[x y] z] w]
+        // NOTE: Performance is sensitive to the exact formulation here
+        let init = utf8_first_byte(x, 2);
+        let y = unwrap_or_0(bytes.next());
+        let mut ch = utf8_acc_cont_byte(init, y);
+        if x >= 0xE0 {
+            // [[x y z] w] case
+            // 5th bit in 0xE0 .. 0xEF is always clear, so `init` is still valid
+            let z = unwrap_or_0(bytes.next());
+            let y_z = utf8_acc_cont_byte((y & CONT_MASK) as u32, z);
+            ch = init << 12 | y_z;
+            if x >= 0xF0 {
+                // [x y z w] case
+                // use only the lower 3 bits of `init`
+                let w = unwrap_or_0(bytes.next());
+                ch = (init & 7) << 18 | utf8_acc_cont_byte(y_z, w);
+            }
+        }
+
+        Some(ch)
+    }
 }
 
 #[cfg(test)]
@@ -1365,10 +1407,10 @@ mod tests {
         }
 
         let tests = vec![
-            ("/HI", "/hi", false),
-            ("/HI/", "/hi", true),
-            ("/B", "/b/", true),
-            ("/B/", "/b/", false),
+            //("/HI", "/hi", false),
+            //("/HI/", "/hi", true),
+            //("/B", "/b/", true),
+            //("/B/", "/b/", false),
             ("/abc", "/ABC/", true),
             ("/abc/", "/ABC/", false),
             ("/aBc", "/ABC/", true),

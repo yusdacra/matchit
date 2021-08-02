@@ -11,11 +11,14 @@ repository = "https://github.com/ibraheemdev/matchit"
 readme = "README.md"
 
 [dependencies]
+tokio = { version = "1.9.0", features = ["full"] }
+tower-service = "0.3.1"
 # None :)
 
 [dev-dependencies]
 # Benchmarks
-criterion = "0.3.4"
+criterion = { version = "0.3.4", features = ["async_tokio"] }
+axum = "0.1.1"
 actix-router = "0.2.7"
 regex = "1.5.4"
 route-recognizer = "0.3.0"
