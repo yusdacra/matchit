@@ -126,24 +126,6 @@ impl<T> Node<T> {
             if prefix.len() > i {
                 prefix = &prefix[i..];
 
-                if current.wild_child {
-                    current = &mut current.children[0];
-                    current.priority += 1;
-
-                    // Check if the wildcard matches
-                    if prefix.len() >= current.prefix.len()
-                    && current.prefix == prefix[..current.prefix.len()]
-                    // Adding a child to a CatchAll Node is not possible
-                    && current.node_type != NodeType::CatchAll
-                    // Check for longer wildcard, e.g. :name and :names
-                    && (current.prefix.len() >= prefix.len() || prefix[current.prefix.len()] == b'/')
-                    {
-                        continue 'walk;
-                    } else {
-                        return Err(InsertError::conflict(&path, &prefix, &current.prefix));
-                    }
-                }
-
                 let idxc = prefix[0];
 
                 // `/` after param
@@ -167,12 +149,29 @@ impl<T> Node<T> {
                     }
                 }
 
-                // Otherwise insert it
-                if idxc != b':' && idxc != b'*' {
+                if idxc != b':' && idxc != b'*' && current.node_type != NodeType::CatchAll {
                     current.indices.push(idxc);
-                    current.children.push(Self::default());
+                    current.add_child(Self::default());
                     current.update_child_priority(current.indices.len() - 1);
                     current = current.children.last_mut().unwrap();
+                } else if current.wild_child {
+                    // inserting a wildcard node, need to check if it conflicts with the existing wildcard
+                    let idx = current.children.len() - 1;
+                    current = &mut current.children[idx];
+                    current.priority += 1;
+
+                    // Check if the wildcard matches
+                    if prefix.len() >= current.prefix.len()
+                    && current.prefix == prefix[..current.prefix.len()]
+                    // Adding a child to a CatchAll Node is not possible
+                    && current.node_type != NodeType::CatchAll
+                    // Check for longer wildcard, e.g. :name and :names
+                    && (current.prefix.len() >= prefix.len() || prefix[current.prefix.len()] == b'/')
+                    {
+                        continue 'walk;
+                    } else {
+                        return Err(InsertError::conflict(&path, &prefix, &current.prefix));
+                    }
                 }
 
                 return current.insert_child(prefix, &path, val);
@@ -190,15 +189,15 @@ impl<T> Node<T> {
     }
 
     // add a child node, keeping wildcards at the end
-    //fn add_child(&mut self, child: Node<T>) {
-    //    let len = self.children.len();
+    fn add_child(&mut self, child: Node<T>) {
+        let len = self.children.len();
 
-    //    if self.wild_child && len > 0 {
-    //        self.children.insert(len - 1, child);
-    //    } else {
-    //        self.children.push(child);
-    //    }
-    //}
+        if self.wild_child && len > 0 {
+            self.children.insert(len - 1, child);
+        } else {
+            self.children.push(child);
+        }
+    }
 
     // Increments priority of the given child and reorders if necessary
     // returns the new position (index) of the child
@@ -258,12 +257,6 @@ impl<T> Node<T> {
                 return Err(InsertError::UnnamedParam);
             }
 
-            // check if this Node existing children which would be
-            // unreachable if we insert the wildcard here
-            if !current.children.is_empty() {
-                return Err(InsertError::conflict(&full_path, &prefix, &current.prefix));
-            }
-
             // Param
             if wildcard[0] == b':' {
                 // Insert prefix before the current wildcard
@@ -279,7 +272,7 @@ impl<T> Node<T> {
                 };
 
                 current.wild_child = true;
-                current.children = vec![child];
+                current.add_child(child);
 
                 current = &mut current.children[0];
                 current.priority += 1;
@@ -293,7 +286,7 @@ impl<T> Node<T> {
                         ..Self::default()
                     };
 
-                    current.children = vec![child];
+                    current.add_child(child);
                     current = &mut current.children[0];
                     continue;
                 }
@@ -331,7 +324,7 @@ impl<T> Node<T> {
                 ..Self::default()
             };
 
-            current.children = vec![child];
+            current.add_child(child);
 
             current = &mut current.children[0];
             current.priority += 1;
@@ -405,23 +398,21 @@ impl<T> Node<T> {
         let mut path = path;
         let mut params = Params::new();
 
-        // outer loop for walking the tree to get a path's value
         'walk: loop {
             let prefix = &current.prefix;
             if path.len() > prefix.len() {
                 if prefix == &path[..prefix.len()] {
                     path = &path[prefix.len()..];
 
-                    // If this node does not have a wildcard (Param or CatchAll)
-                    // child, we can just look up the next child node and continue
-                    // to walk down the tree
-                    if !current.wild_child {
-                        let idxc = path[0];
-                        if let Some(i) = current.indices.iter().position(|&c| c == idxc) {
-                            current = &current.children[i];
-                            continue 'walk;
-                        }
+                    let idx = path[0];
 
+                    if let Some(i) = current.indices.iter().position(|&c| c == idx) {
+                        current = &current.children[i];
+                        continue 'walk;
+                    }
+
+                    // If there is no wildcard pattern, recommend a redirection
+                    if !current.wild_child {
                         // Nothing found.
                         // We can recommend to redirect to the same URL without a
                         // trailing slash if a leaf exists for that path.
@@ -429,7 +420,9 @@ impl<T> Node<T> {
                         return Err(MatchError::new(tsr));
                     }
 
-                    current = &current.children[0];
+                    // Handle wildcard child, which is always at the end of the array
+                    current = &current.children[current.children.len() - 1];
+
                     match current.node_type {
                         NodeType::Param => {
                             // find param end (either '/' or path end)
@@ -866,7 +859,17 @@ mod tests {
                 }
                 Ok(result) => {
                     if request.should_be_nil {
-                        panic!("Expected nil value for route '{}'", request.path);
+                        panic!(
+                            "Expected nil value for route '{}', got: {:?}",
+                            request.path,
+                            {
+                                let mut vec = Vec::new();
+                                for i in result.params.iter() {
+                                    vec.push(i);
+                                }
+                                vec
+                            }
+                        );
                     }
                     let value = result.value;
                     if value != request.route {
@@ -967,6 +970,8 @@ mod tests {
             "/",
             "/cmd/:tool/:sub",
             "/cmd/:tool/",
+            "/cmd/whoami",
+            "/cmd/whoami/root/",
             "/src/*filepath",
             "/search/",
             "/search/:query",
@@ -989,12 +994,26 @@ mod tests {
             vec![
                 TestRequest::new("/", false, "/", Params::new()),
                 TestRequest::new(
+                    "/cmd/test",
+                    true,
+                    "/cmd/:tool/",
+                    params(vec![("tool", "test")]),
+                ),
+                TestRequest::new(
                     "/cmd/test/",
                     false,
                     "/cmd/:tool/",
                     params(vec![("tool", "test")]),
                 ),
-                TestRequest::new("/cmd/test", true, "", params(vec![("tool", "test")])),
+                TestRequest::new("/cmd/whoami", false, "/cmd/whoami", Params::new()),
+                TestRequest::new("/cmd/whoami/", true, "/cmd/whoami", Params::new()),
+                TestRequest::new(
+                    "/cmd/whoami/root/",
+                    false,
+                    "/cmd/whoami/root/",
+                    Params::new(),
+                ),
+                TestRequest::new("/cmd/whoami/root", true, "/cmd/whoami/root/", Params::new()),
                 TestRequest::new(
                     "/cmd/test/3",
                     false,
@@ -1072,7 +1091,7 @@ mod tests {
 
             if route.1 {
                 if res.is_ok() {
-                    panic!("no panic for conflicting route '{}'", route.0);
+                    panic!("no panic for conflicting route '{}'", route.1);
                 }
             } else if res.is_err() {
                 panic!("unexpected panic for route '{}': {:?}", route.0, res);
@@ -1084,21 +1103,40 @@ mod tests {
     fn test_tree_wildcard_conflict() {
         let routes = vec![
             ("/cmd/:tool/:sub", false),
-            ("/cmd/vet", true),
+            ("/cmd/vet", false),
+            ("/foo/bar", false),
+            ("/foo/:name", false),
+            ("/foo/:names", true),
+            ("/cmd/*path", true),
+            ("/cmd/:badvar", true),
+            ("/cmd/:tool/names", false),
+            ("/cmd/:tool/:badsub/details", true),
             ("/src/*filepath", false),
+            ("/src/:file", true),
+            ("/src/static.json", true),
             ("/src/*filepathx", true),
             ("/src/", true),
+            ("/src/foo/bar", true),
             ("/src1/", false),
             ("/src1/*filepath", true),
             ("/src2*filepath", true),
+            ("/src2/*filepath", false),
             ("/search/:query", false),
-            ("/search/invalid", true),
+            ("/search/valid", false),
             ("/user_:name", false),
-            ("/user_x", true),
+            ("/user_x", false),
             ("/user_:name", true),
             ("/id:id", false),
-            ("/id/:id", true),
+            ("/id/:id", false),
         ];
+
+        test_routes(routes);
+    }
+
+    #[test]
+    fn test_catchall_after_slash() {
+        let routes = vec![("/non-leading-*catchall", true)];
+
         test_routes(routes);
     }
 
@@ -1106,14 +1144,17 @@ mod tests {
     fn test_tree_child_conflict() {
         let routes = vec![
             ("/cmd/vet", false),
-            ("/cmd/:tool/:sub", true),
+            ("/cmd/:tool", false),
+            ("/cmd/:tool/:sub", false),
+            ("/cmd/:tool/misc", false),
+            ("/cmd/:tool/:othersub", true),
             ("/src/AUTHORS", false),
             ("/src/*filepath", true),
             ("/user_x", false),
-            ("/user_:name", true),
+            ("/user_:name", false),
             ("/id/:id", false),
-            ("/id:id", true),
-            ("/:id", true),
+            ("/id:id", false),
+            ("/:id", false),
             ("/*filepath", true),
         ];
 
@@ -1500,8 +1541,7 @@ mod tests {
             ("/who/are/foo", "/who/are/*you"),
             ("/who/are/foo/", "/who/are/*you"),
             ("/who/are/foo/bar", "/who/are/*you"),
-            ("/conxxx", "/con:tact"),
-            ("/conooo/xxx", "/con:tact"),
+            ("/con:nection", "/con:tact"),
             ("/whose/:users/:user", "/whose/:users/:name"),
         ];
 
