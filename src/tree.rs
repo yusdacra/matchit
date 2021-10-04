@@ -82,7 +82,7 @@ impl<T> Default for Node<T> {
 }
 
 struct Skip<'a, T> {
-    path: &'static [u8],
+    prefix: &'a [u8],
     node: &'a Node<T>,
 }
 
@@ -428,7 +428,9 @@ impl<T> Node<T> {
         let mut current = self;
         let mut path = full_path;
         let mut params = Params::new();
+
         let mut skipped = None;
+        let mut backtracking = false;
 
         'walk: loop {
             let prefix = &current.prefix;
@@ -438,24 +440,20 @@ impl<T> Node<T> {
 
                     let idx = path[0];
 
-                    if let Some(i) = current.indices.iter().position(|&c| c == idx) {
-                        if current.children[current.children.len() - 1]
-                            .prefix
-                            .starts_with(b":")
-                        {
-                            skipped = Some(Skip {
-                                path: Box::leak([prefix, path].concat().into_boxed_slice()),
-                                // TODO: fix, also tests failing because clone is messing up mutate
-                                // Add `is_checking_skipped` bool to avoid indice checking
-                                node: {
-                                    let mut node = current.clone();
-                                    node.indices = vec![];
-                                    Box::leak(Box::new(node))
-                                },
-                            });
+                    if !backtracking {
+                        if let Some(i) = current.indices.iter().position(|&c| c == idx) {
+                            if current.children[current.children.len() - 1]
+                                .prefix
+                                .starts_with(b":")
+                            {
+                                skipped = Some(Skip {
+                                    prefix,
+                                    node: &current,
+                                });
+                            }
+                            current = &current.children[i];
+                            continue 'walk;
                         }
-                        current = &current.children[i];
-                        continue 'walk;
                     }
 
                     // If there is no wildcard pattern, recommend a redirection
@@ -486,6 +484,7 @@ impl<T> Node<T> {
                                 }
 
                                 path = &path[end..];
+                                backtracking = false;
                                 current = &current.children[0];
                                 continue 'walk;
                             }
@@ -493,12 +492,14 @@ impl<T> Node<T> {
                             if let Some(value) = current.value.as_ref() {
                                 return Ok(Match { value, params });
                             } else if current.children.len() == 1 {
+                                backtracking = false;
                                 current = &current.children[0];
 
                                 // No value found. Check if a value for this path + a
                                 // trailing slash exists for TSR recommendation
                                 let tsr = (current.prefix == b"/" && current.value.is_some())
-                                    || (current.prefix.is_empty() && current.indices == b"/");
+                                    || (current.prefix.is_empty()
+                                        && (!backtracking && current.indices == b"/"));
                                 return Err(MatchError::new(tsr));
                             }
 
@@ -531,21 +532,30 @@ impl<T> Node<T> {
 
                 // No value found. Check if a value for this path + a
                 // trailing slash exists for trailing slash recommendation
-                if let Some(i) = current.indices.iter().position(|&c| c == b'/') {
-                    current = &current.children[i];
-                    let tsr = (current.prefix.len() == 1 && current.value.is_some())
-                        || (current.node_type == NodeType::CatchAll
-                            && current.children[0].value.is_some());
-                    return Err(MatchError::new(tsr));
+                if !backtracking {
+                    if let Some(i) = current.indices.iter().position(|&c| c == b'/') {
+                        current = &current.children[i];
+                        let tsr = (current.prefix.len() == 1 && current.value.is_some())
+                            || (current.node_type == NodeType::CatchAll
+                                && current.children[0].value.is_some());
+                        return Err(MatchError::new(tsr));
+                    }
                 }
 
                 return Err(MatchError::new(false));
             }
 
             if let Some(skip) = skipped {
-                if path != b"/" && skip.path.ends_with(path) {
-                    path = &skip.path;
+                // TODO: Avoid doing this search
+                let path_from_skipped = &full_path[full_path
+                    .windows(skip.prefix.len())
+                    .position(|x| x == skip.prefix)
+                    .unwrap()..];
+
+                if path != b"/" && path_from_skipped.ends_with(path) {
                     current = &skip.node;
+                    path = path_from_skipped;
+                    backtracking = true;
                     skipped = None;
                     continue 'walk;
                 }
