@@ -43,6 +43,26 @@ pub struct Node<T> {
     priority: u32,
 }
 
+impl<T> Clone for Node<T>
+where
+    T: Clone,
+{
+    fn clone(&self) -> Self {
+        Self {
+            prefix: self.prefix.clone(),
+            wild_child: self.wild_child,
+            node_type: self.node_type,
+            indices: self.indices.clone(),
+            children: self.children.clone(),
+            value: self
+                .value
+                .as_ref()
+                .map(|v| UnsafeCell::new(unsafe { &*v.get() }.clone())),
+            priority: self.priority,
+        }
+    }
+}
+
 // SAFETY: we expose `value` per rust's usual borrowing rules, so we can just delegate these traits
 unsafe impl<T: Send> Send for Node<T> {}
 unsafe impl<T: Sync> Sync for Node<T> {}
@@ -61,10 +81,9 @@ impl<T> Default for Node<T> {
     }
 }
 
-struct Skip<'n, 'p, T> {
-    path: &'p [u8],
-    prefix: &'n [u8],
-    node: &'n Node<T>,
+struct Skip<'a, T> {
+    path: &'static [u8],
+    node: &'a Node<T>,
 }
 
 impl<T> Node<T> {
@@ -157,9 +176,9 @@ impl<T> Node<T> {
 
                 if idxc != b':' && idxc != b'*' && current.node_type != NodeType::CatchAll {
                     current.indices.push(idxc);
-                    current.add_child(Self::default());
+                    let child = current.add_child(Self::default());
                     current.update_child_priority(current.indices.len() - 1);
-                    current = current.children.last_mut().unwrap();
+                    current = &mut current.children[child];
                 } else if current.wild_child {
                     // inserting a wildcard node, need to check if it conflicts with the existing wildcard
                     let idx = current.children.len() - 1;
@@ -175,9 +194,9 @@ impl<T> Node<T> {
                     && (current.prefix.len() >= prefix.len() || prefix[current.prefix.len()] == b'/')
                     {
                         continue 'walk;
-                    } else {
-                        return Err(InsertError::conflict(&path, &prefix, &current.prefix));
                     }
+
+                    return Err(InsertError::conflict(&path, &prefix, &current.prefix));
                 }
 
                 return current.insert_child(prefix, &path, val);
@@ -195,13 +214,16 @@ impl<T> Node<T> {
     }
 
     // add a child node, keeping wildcards at the end
-    fn add_child(&mut self, child: Node<T>) {
+    fn add_child(&mut self, child: Node<T>) -> usize {
         let len = self.children.len();
 
         if self.wild_child && len > 0 {
             self.children.insert(len - 1, child);
+            return len - 1;
         } else {
             self.children.push(child);
+            // TODO: len + 1
+            return len;
         }
     }
 
@@ -277,10 +299,9 @@ impl<T> Node<T> {
                     ..Self::default()
                 };
 
+                let child = current.add_child(child);
                 current.wild_child = true;
-                current.add_child(child);
-
-                current = &mut current.children[0];
+                current = &mut current.children[child];
                 current.priority += 1;
 
                 // If the path doesn't end with the wildcard, then there
@@ -292,8 +313,8 @@ impl<T> Node<T> {
                         ..Self::default()
                     };
 
-                    current.add_child(child);
-                    current = &mut current.children[0];
+                    let child = current.add_child(child);
+                    current = &mut current.children[child];
                     continue;
                 }
 
@@ -330,9 +351,8 @@ impl<T> Node<T> {
                 ..Self::default()
             };
 
-            current.add_child(child);
-
-            current = &mut current.children[0];
+            let child = current.add_child(child);
+            current = &mut current.children[child];
             current.priority += 1;
 
             // Second node: node holding the variable
@@ -363,7 +383,10 @@ impl<T> Node<T> {
     /// # Ok(())
     /// # }
     /// ```
-    pub fn at<'a>(&'a self, path: &'a str) -> Result<Match<'a, &'a T>, MatchError> {
+    pub fn at<'a>(&'a self, path: &'a str) -> Result<Match<'a, &'a T>, MatchError>
+    where
+        Node<T>: Clone,
+    {
         match self.at_inner(path.as_bytes()) {
             Ok(v) => Ok(Match {
                 // SAFETY: We only expose unique references to value through &mut self
@@ -378,7 +401,10 @@ impl<T> Node<T> {
     /// Tries to find a value in the router matching the given path, and returns a mutable
     /// reference to it. If no value can be found it returns a trailing slash redirect
     /// recommendation, see [`tsr`](crate::MatchError::tsr).
-    pub fn at_mut<'a>(&'a mut self, path: &'a str) -> Result<Match<'a, &'a mut T>, MatchError> {
+    pub fn at_mut<'a>(&'a mut self, path: &'a str) -> Result<Match<'a, &'a mut T>, MatchError>
+    where
+        Node<T>: Clone,
+    {
         match self.at_inner(path.as_bytes()) {
             Ok(v) => Ok(Match {
                 // SAFETY: We have a unique reference to self
@@ -392,9 +418,15 @@ impl<T> Node<T> {
     // It's a bit sad that we have to introduce unsafe here, but rust doesn't really have a way
     // to abstract over mutability, so it avoids having to duplicate logic between `at` and
     // `at_mut`.
-    fn at_inner<'a>(&'a self, path: &'a [u8]) -> Result<Match<'a, &'a UnsafeCell<T>>, MatchError> {
+    fn at_inner<'a>(
+        &'a self,
+        full_path: &'a [u8],
+    ) -> Result<Match<'a, &'a UnsafeCell<T>>, MatchError>
+    where
+        Node<T>: Clone,
+    {
         let mut current = self;
-        let mut path = path;
+        let mut path = full_path;
         let mut params = Params::new();
         let mut skipped = None;
 
@@ -409,12 +441,17 @@ impl<T> Node<T> {
                     if let Some(i) = current.indices.iter().position(|&c| c == idx) {
                         if current.children[current.children.len() - 1]
                             .prefix
-                            .ends_with(b":")
+                            .starts_with(b":")
                         {
                             skipped = Some(Skip {
-                                prefix: &prefix,
-                                path: &path,
-                                node: &current,
+                                path: Box::leak([prefix, path].concat().into_boxed_slice()),
+                                // TODO: fix, also tests failing because clone is messing up mutate
+                                // Add `is_checking_skipped` bool to avoid indice checking
+                                node: {
+                                    let mut node = current.clone();
+                                    node.indices = vec![];
+                                    Box::leak(Box::new(node))
+                                },
                             });
                         }
                         current = &current.children[i];
@@ -506,7 +543,7 @@ impl<T> Node<T> {
             }
 
             if let Some(skip) = skipped {
-                if path != b"/" && skip.prefix.ends_with(path) {
+                if path != b"/" && skip.path.ends_with(path) {
                     path = &skip.path;
                     current = &skip.node;
                     skipped = None;
@@ -890,11 +927,10 @@ mod tests {
                             }
                         );
                     }
-                    let value = result.value;
-                    if value != request.route {
+                    if result.value != request.route {
                         panic!(
                             "Wrong value for route '{}'. Expected '{}', found '{}')",
-                            request.path, value, request.route
+                            request.path, result.value, request.route
                         );
                     }
                     assert_eq!(
@@ -987,13 +1023,16 @@ mod tests {
 
         let routes = vec![
             "/",
-            "/cmd/:tool/:sub",
             "/cmd/:tool/",
+            "/cmd/:tool/:sub",
             "/cmd/whoami",
+            "/cmd/whoami/root",
             "/cmd/whoami/root/",
             "/src/*filepath",
             "/search/",
             "/search/:query",
+            "/search/gin-gonic",
+            "/search/google",
             "/user_:name",
             "/user_:name/about",
             "/files/:dir/*filepath",
@@ -1002,6 +1041,7 @@ mod tests {
             "/doc/go1.html",
             "/info/:user/public",
             "/info/:user/project/:project",
+            "/info/:user/project/golang",
         ];
 
         for route in routes {
@@ -1024,20 +1064,44 @@ mod tests {
                     "/cmd/:tool/",
                     params(vec![("tool", "test")]),
                 ),
-                TestRequest::new("/cmd/whoami", false, "/cmd/whoami", Params::new()),
-                TestRequest::new("/cmd/whoami/", true, "/cmd/whoami", Params::new()),
-                TestRequest::new(
-                    "/cmd/whoami/root/",
-                    false,
-                    "/cmd/whoami/root/",
-                    Params::new(),
-                ),
-                TestRequest::new("/cmd/whoami/root", true, "/cmd/whoami/root/", Params::new()),
                 TestRequest::new(
                     "/cmd/test/3",
                     false,
                     "/cmd/:tool/:sub",
                     params(vec![("tool", "test"), ("sub", "3")]),
+                ),
+                TestRequest::new(
+                    "/cmd/who",
+                    true,
+                    "/cmd/:tool/",
+                    params(vec![("tool", "who")]),
+                ),
+                TestRequest::new(
+                    "/cmd/who/",
+                    false,
+                    "/cmd/:tool/",
+                    params(vec![("tool", "who")]),
+                ),
+                TestRequest::new("/cmd/whoami", false, "/cmd/whoami", Params::new()),
+                TestRequest::new("/cmd/whoami/", true, "/cmd/whoami", Params::new()),
+                TestRequest::new(
+                    "/cmd/whoami/r",
+                    false,
+                    "/cmd/:tool/:sub",
+                    params(vec![("tool", "whoami"), ("sub", "r")]),
+                ),
+                TestRequest::new(
+                    "/cmd/whoami/r/",
+                    true,
+                    "/cmd/:tool/:sub",
+                    params(vec![("tool", "whoami"), ("sub", "r")]),
+                ),
+                TestRequest::new("/cmd/whoami/root", false, "/cmd/whoami/root", Params::new()),
+                TestRequest::new(
+                    "/cmd/whoami/root/",
+                    false,
+                    "/cmd/whoami/root/",
+                    Params::new(),
                 ),
                 TestRequest::new(
                     "/src/",
