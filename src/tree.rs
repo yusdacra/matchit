@@ -43,26 +43,6 @@ pub struct Node<T> {
     priority: u32,
 }
 
-impl<T> Clone for Node<T>
-where
-    T: Clone,
-{
-    fn clone(&self) -> Self {
-        Self {
-            prefix: self.prefix.clone(),
-            wild_child: self.wild_child,
-            node_type: self.node_type,
-            indices: self.indices.clone(),
-            children: self.children.clone(),
-            value: self
-                .value
-                .as_ref()
-                .map(|v| UnsafeCell::new(unsafe { &*v.get() }.clone())),
-            priority: self.priority,
-        }
-    }
-}
-
 // SAFETY: we expose `value` per rust's usual borrowing rules, so we can just delegate these traits
 unsafe impl<T: Send> Send for Node<T> {}
 unsafe impl<T: Sync> Sync for Node<T> {}
@@ -81,7 +61,6 @@ impl<T> Default for Node<T> {
     }
 }
 
-#[derive(Clone)]
 struct Skipped<'n, 'p, T> {
     path: &'p [u8],
     node: &'n Node<T>,
