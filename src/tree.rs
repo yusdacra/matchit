@@ -162,8 +162,7 @@ impl<T> Node<T> {
                     current = &mut current.children[child];
                 } else if current.wild_child {
                     // inserting a wildcard node, need to check if it conflicts with the existing wildcard
-                    let idx = current.children.len() - 1;
-                    current = &mut current.children[idx];
+                    current = current.children.last_mut().unwrap();
                     current.priority += 1;
 
                     // Check if the wildcard matches
@@ -309,7 +308,7 @@ impl<T> Node<T> {
                 return Err(InsertError::InvalidCatchAll);
             }
 
-            if !current.prefix.is_empty() && current.prefix[current.prefix.len() - 1] == b'/' {
+            if !current.prefix.is_empty() && current.prefix.last().copied() == Some(b'/') {
                 return Err(InsertError::conflict(&full_path, &prefix, &current.prefix));
             }
 
@@ -459,7 +458,7 @@ impl<T> Node<T> {
                     }
 
                     // Handle wildcard child, which is always at the end of the array
-                    current = &current.children[current.children.len() - 1];
+                    current = current.children.last().unwrap();
 
                     match current.node_type {
                         NodeType::Param => {
