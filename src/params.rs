@@ -60,6 +60,26 @@ impl<'a> Params<'a> {
         Self { kind }
     }
 
+    pub(crate) fn len(&self) -> usize {
+        match &self.kind {
+            ParamsKind::None => 0,
+            ParamsKind::Small(_, len) => *len,
+            ParamsKind::Large(vec) => vec.len(),
+        }
+    }
+
+    pub(crate) fn truncate(&mut self, n: usize) {
+        match &mut self.kind {
+            ParamsKind::None => {}
+            ParamsKind::Small(_, len) => {
+                *len = n;
+            }
+            ParamsKind::Large(vec) => {
+                vec.truncate(n);
+            }
+        }
+    }
+
     /// Returns the value of the first parameter registered under the given key.
     pub fn get(&self, key: impl AsRef<str>) -> Option<&'a str> {
         match &self.kind {

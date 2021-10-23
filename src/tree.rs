@@ -81,9 +81,11 @@ impl<T> Default for Node<T> {
     }
 }
 
-struct Skip<'a, T> {
-    prefix: &'a [u8],
+#[derive(Clone)]
+struct Skipped<'a, T> {
+    path: &'a [u8],
     node: &'a Node<T>,
+    params: usize,
 }
 
 impl<T> Node<T> {
@@ -429,7 +431,7 @@ impl<T> Node<T> {
         let mut path = full_path;
         let mut params = Params::new();
 
-        let mut skipped = None;
+        let mut skipped_nodes: Option<Vec<Skipped<'a, T>>> = None;
         let mut backtracking = false;
 
         'walk: loop {
@@ -440,19 +442,36 @@ impl<T> Node<T> {
 
                     let idx = path[0];
 
+                    // skip indices check when backtracking
                     if !backtracking {
                         if let Some(i) = current.indices.iter().position(|&c| c == idx) {
-                            if current.children[current.children.len() - 1]
-                                .prefix
-                                .starts_with(b":")
-                            {
-                                skipped = Some(Skip {
-                                    prefix,
-                                    node: &current,
-                                });
+                            if current.wild_child {
+                                skipped_nodes
+                                    .get_or_insert_with(Default::default)
+                                    .push(Skipped {
+                                        path: &full_path
+                                            [full_path.len() - (prefix.len() + path.len())..],
+                                        node: &current,
+                                        params: params.len(),
+                                    });
                             }
                             current = &current.children[i];
                             continue 'walk;
+                        }
+                    }
+
+                    if path != b"/" && !current.wild_child {
+                        if let Some(skipped_nodes) = &mut skipped_nodes {
+                            while let Some(skipped) = skipped_nodes.pop() {
+                                if skipped.path.ends_with(path) {
+                                    path = skipped.path;
+                                    current = &skipped.node;
+                                    params.truncate(skipped.params);
+
+                                    backtracking = true;
+                                    continue 'walk;
+                                }
+                            }
                         }
                     }
 
@@ -484,22 +503,21 @@ impl<T> Node<T> {
                                 }
 
                                 path = &path[end..];
-                                backtracking = false;
                                 current = &current.children[0];
+
+                                backtracking = false;
                                 continue 'walk;
                             }
 
                             if let Some(value) = current.value.as_ref() {
                                 return Ok(Match { value, params });
                             } else if current.children.len() == 1 {
-                                backtracking = false;
                                 current = &current.children[0];
 
                                 // No value found. Check if a value for this path + a
                                 // trailing slash exists for TSR recommendation
                                 let tsr = (current.prefix == b"/" && current.value.is_some())
-                                    || (current.prefix.is_empty()
-                                        && (!backtracking && current.indices == b"/"));
+                                    || (current.prefix.is_empty() && (current.indices == b"/"));
                                 return Err(MatchError::new(tsr));
                             }
 
@@ -516,7 +534,24 @@ impl<T> Node<T> {
                         _ => unreachable!(),
                     }
                 }
-            } else if path == prefix {
+            }
+
+            if path == prefix {
+                if current.value.is_none() && path != b"/" {
+                    if let Some(skipped_nodes) = &mut skipped_nodes {
+                        while let Some(skipped) = skipped_nodes.pop() {
+                            if skipped.path.ends_with(path) {
+                                path = skipped.path;
+                                current = &skipped.node;
+                                params.truncate(skipped.params);
+
+                                backtracking = true;
+                                continue 'walk;
+                            }
+                        }
+                    }
+                }
+
                 // We should have reached the node containing the value.
                 // Check if this node has a value registered.
                 if let Some(value) = current.value.as_ref() {
@@ -545,30 +580,24 @@ impl<T> Node<T> {
                 return Err(MatchError::new(false));
             }
 
-            if let Some(skip) = skipped {
-                // TODO: Avoid doing this search
-                let path_from_skipped = &full_path[full_path
-                    .windows(skip.prefix.len())
-                    .position(|x| x == skip.prefix)
-                    .unwrap()..];
+            if path != b"/" {
+                if let Some(skipped_nodes) = &mut skipped_nodes {
+                    while let Some(skipped) = skipped_nodes.pop() {
+                        if skipped.path.ends_with(path) {
+                            path = skipped.path;
+                            current = &skipped.node;
+                            params.truncate(skipped.params);
 
-                if path != b"/" && path_from_skipped.ends_with(path) {
-                    current = &skip.node;
-                    path = path_from_skipped;
-                    backtracking = true;
-                    skipped = None;
-                    continue 'walk;
+                            backtracking = true;
+                            continue 'walk;
+                        }
+                    }
                 }
             }
 
             // Nothing found. We can recommend to redirect to the same URL with an
             // extra trailing slash if a leaf exists for that path
-            let tsr = (path == b"/")
-                || (prefix.len() == path.len() + 1
-                    && prefix[path.len()] == b'/'
-                    && path == &prefix[..prefix.len() - 1]
-                    && current.value.is_some());
-
+            let tsr = (path == b"/") || (prefix.len() == path.len() + 1 && current.value.is_some());
             return Err(MatchError::new(tsr));
         }
     }
@@ -890,74 +919,67 @@ mod tests {
 
     struct TestRequest {
         path: &'static str,
-        should_be_nil: bool,
         route: &'static str,
-        params: Params<'static>,
+        params: Option<Params<'static>>,
     }
 
-    impl TestRequest {
-        pub fn new(
-            path: &'static str,
-            should_be_nil: bool,
-            route: &'static str,
-            params: Params<'static>,
-        ) -> TestRequest {
-            TestRequest {
-                path,
-                should_be_nil,
-                route,
-                params,
-            }
+    fn req(
+        path: &'static str,
+        route: &'static str,
+        vec: Option<Vec<(&'static str, &'static str)>>,
+    ) -> TestRequest {
+        TestRequest {
+            path,
+            route,
+            params: vec.map(params),
         }
     }
 
-    type TestRequests = Vec<TestRequest>;
-
-    fn check_requests(tree: &mut Node<String>, requests: TestRequests) {
+    fn check_requests(tree: &mut Node<String>, requests: Vec<TestRequest>) {
         for request in requests {
             let res = tree.at(request.path);
 
             match res {
                 Err(_) => {
-                    if !request.should_be_nil {
+                    if request.params.is_some() {
                         panic!("Expected non-nil value for route '{}'", request.path);
                     }
                 }
                 Ok(result) => {
-                    if request.should_be_nil {
-                        panic!(
-                            "Expected nil value for route '{}', got: {:?}",
-                            request.path,
-                            {
-                                let mut vec = Vec::new();
-                                for i in result.params.iter() {
-                                    vec.push(i);
-                                }
-                                vec
+                    match request.params {
+                        Some(expected_params) => {
+                            if result.value != request.route {
+                                panic!(
+                                    "Wrong value for route '{}'. Expected '{}', found '{}')",
+                                    request.path, result.value, request.route
+                                );
                             }
-                        );
+
+                            assert_eq!(
+                                result.params, expected_params,
+                                "Wrong params for route '{}'",
+                                request.path
+                            );
+
+                            // test at_mut
+                            let res_mut = tree.at_mut(request.path).unwrap();
+                            res_mut.value.push_str("CHECKED");
+
+                            let res = tree.at(request.path).unwrap();
+                            assert!(res.value.contains("CHECKED"));
+
+                            let res_mut = tree.at_mut(request.path).unwrap();
+                            *res_mut.value = res_mut.value.replace("CHECKED", "");
+                        }
+
+                        None => {
+                            panic!(
+                                "Expected nil value for route '{}', got: {:?}",
+                                request.path,
+                                result.params.iter().collect::<Vec<_>>()
+                            );
+                        }
                     }
-                    if result.value != request.route {
-                        panic!(
-                            "Wrong value for route '{}'. Expected '{}', found '{}')",
-                            request.path, result.value, request.route
-                        );
-                    }
-                    assert_eq!(
-                        result.params, request.params,
-                        "Wrong params for route '{}'",
-                        request.path
-                    );
-
-                    // test at_mut
-                    let res_mut = tree.at_mut(request.path).unwrap();
-                    res_mut.value.push_str("CHECKED");
-
-                    let res = tree.at(request.path).unwrap();
-                    assert!(res.value.contains("CHECKED"));
-
-                    let res_mut = tree.at_mut(request.path).unwrap();
-                    *res_mut.value = res_mut.value.replace("CHECKED", "");
                 }
             };
         }
@@ -1010,17 +1032,17 @@ mod tests {
         check_requests(
             &mut tree,
             vec![
-                TestRequest::new("/a", false, "/a", Params::new()),
-                TestRequest::new("/", true, "", Params::new()),
-                TestRequest::new("/hi", false, "/hi", Params::new()),
-                TestRequest::new("/contact", false, "/contact", Params::new()),
-                TestRequest::new("/co", false, "/co", Params::new()),
-                TestRequest::new("/con", true, "", Params::new()), // key mismatch
-                TestRequest::new("/cona", true, "", Params::new()), // key mismatch
-                TestRequest::new("/no", true, "", Params::new()),  // no matching child
-                TestRequest::new("/ab", false, "/ab", Params::new()),
-                TestRequest::new("/ʯ", false, "/ʯ", Params::new()),
-                TestRequest::new("/β", false, "/β", Params::new()),
+                req("/a", "/a", Some(vec![])),
+                req("/", "", None),
+                req("/hi", "/hi", Some(vec![])),
+                req("/contact", "/contact", Some(vec![])),
+                req("/co", "/co", Some(vec![])),
+                req("/con", "", None),  // key mismatch
+                req("/cona", "", None), // key mismatch
+                req("/no", "", None),   // no matching child
+                req("/ab", "/ab", Some(vec![])),
+                req("/ʯ", "/ʯ", Some(vec![])),
+                req("/β", "/β", Some(vec![])),
             ],
         );
 
@@ -1052,6 +1074,39 @@ mod tests {
             "/info/:user/public",
             "/info/:user/project/:project",
             "/info/:user/project/golang",
+            "/aa/*xx",
+            "/ab/*xx",
+            "/:cc",
+            "/c1/:dd/e",
+            "/c1/:dd/e1",
+            "/:cc/cc",
+            "/:cc/:dd/ee",
+            "/:cc/:dd/:ee/ff",
+            "/:cc/:dd/:ee/:ff/gg",
+            "/:cc/:dd/:ee/:ff/:gg/hh",
+            "/get/test/abc/",
+            "/get/:param/abc/",
+            "/something/:paramname/thirdthing",
+            "/something/secondthing/test",
+            "/get/abc",
+            "/get/:param",
+            "/get/abc/123abc",
+            "/get/abc/:param",
+            "/get/abc/123abc/xxx8",
+            "/get/abc/123abc/:param",
+            "/get/abc/123abc/xxx8/1234",
+            "/get/abc/123abc/xxx8/:param",
+            "/get/abc/123abc/xxx8/1234/ffas",
+            "/get/abc/123abc/xxx8/1234/:param",
+            "/get/abc/123abc/xxx8/1234/kkdd/12c",
+            "/get/abc/123abc/xxx8/1234/kkdd/:param",
+            "/get/abc/:param/test",
+            "/get/abc/123abd/:param",
+            "/get/abc/123abddd/:param",
+            "/get/abc/123/:param",
+            "/get/abc/123abg/:param",
+            "/get/abc/123abf/:param",
+            "/get/abc/123abfff/:param",
         ];
 
         for route in routes {
@@ -1061,112 +1116,392 @@ mod tests {
         check_requests(
             &mut tree,
             vec![
-                TestRequest::new("/", false, "/", Params::new()),
-                TestRequest::new(
-                    "/cmd/test",
-                    true,
-                    "/cmd/:tool/",
-                    params(vec![("tool", "test")]),
-                ),
-                TestRequest::new(
-                    "/cmd/test/",
-                    false,
-                    "/cmd/:tool/",
-                    params(vec![("tool", "test")]),
-                ),
-                TestRequest::new(
+                req("/", "/", Some(vec![])),
+                req("/cmd/test", "/cmd/:tool/", None),
+                req("/cmd/test/", "/cmd/:tool/", Some(vec![("tool", "test")])),
+                req(
                     "/cmd/test/3",
-                    false,
                     "/cmd/:tool/:sub",
-                    params(vec![("tool", "test"), ("sub", "3")]),
+                    Some(vec![("tool", "test"), ("sub", "3")]),
                 ),
-                TestRequest::new(
-                    "/cmd/who",
-                    true,
-                    "/cmd/:tool/",
-                    params(vec![("tool", "who")]),
-                ),
-                TestRequest::new(
-                    "/cmd/who/",
-                    false,
-                    "/cmd/:tool/",
-                    params(vec![("tool", "who")]),
-                ),
-                TestRequest::new("/cmd/whoami", false, "/cmd/whoami", Params::new()),
-                TestRequest::new("/cmd/whoami/", true, "/cmd/whoami", Params::new()),
-                TestRequest::new(
+                req("/cmd/who", "/cmd/:tool/", None),
+                req("/cmd/who/", "/cmd/:tool/", Some(vec![("tool", "who")])),
+                req("/cmd/whoami", "/cmd/whoami", Some(vec![])),
+                req("/cmd/whoami/", "/cmd/whoami", None),
+                req(
                     "/cmd/whoami/r",
-                    false,
                     "/cmd/:tool/:sub",
-                    params(vec![("tool", "whoami"), ("sub", "r")]),
+                    Some(vec![("tool", "whoami"), ("sub", "r")]),
                 ),
-                TestRequest::new(
-                    "/cmd/whoami/r/",
-                    true,
-                    "/cmd/:tool/:sub",
-                    params(vec![("tool", "whoami"), ("sub", "r")]),
-                ),
-                TestRequest::new("/cmd/whoami/root", false, "/cmd/whoami/root", Params::new()),
-                TestRequest::new(
-                    "/cmd/whoami/root/",
-                    false,
-                    "/cmd/whoami/root/",
-                    Params::new(),
-                ),
-                TestRequest::new(
-                    "/src/",
-                    false,
-                    "/src/*filepath",
-                    params(vec![("filepath", "/")]),
-                ),
-                TestRequest::new(
+                req("/cmd/whoami/r/", "/cmd/:tool/:sub", None),
+                req("/cmd/whoami/root", "/cmd/whoami/root", Some(vec![])),
+                req("/cmd/whoami/root/", "/cmd/whoami/root/", Some(vec![])),
+                req("/src/", "/src/*filepath", Some(vec![("filepath", "/")])),
+                req(
                     "/src/some/file.png",
-                    false,
                     "/src/*filepath",
-                    params(vec![("filepath", "/some/file.png")]),
+                    Some(vec![("filepath", "/some/file.png")]),
                 ),
-                TestRequest::new("/search/", false, "/search/", Params::new()),
-                TestRequest::new(
+                req("/search/", "/search/", Some(vec![])),
+                req(
                     "/search/someth!ng+in+ünìcodé",
-                    false,
                     "/search/:query",
-                    params(vec![("query", "someth!ng+in+ünìcodé")]),
+                    Some(vec![("query", "someth!ng+in+ünìcodé")]),
                 ),
-                TestRequest::new(
-                    "/search/someth!ng+in+ünìcodé/",
-                    true,
-                    "",
-                    params(vec![("query", "someth!ng+in+ünìcodé")]),
-                ),
-                TestRequest::new(
+                req("/search/someth!ng+in+ünìcodé/", "", None),
+                req(
                     "/user_rustacean",
-                    false,
                     "/user_:name",
-                    params(vec![("name", "rustacean")]),
+                    Some(vec![("name", "rustacean")]),
                 ),
-                TestRequest::new(
+                req(
                     "/user_rustacean/about",
-                    false,
                     "/user_:name/about",
-                    params(vec![("name", "rustacean")]),
+                    Some(vec![("name", "rustacean")]),
                 ),
-                TestRequest::new(
+                req(
                     "/files/js/inc/framework.js",
-                    false,
                     "/files/:dir/*filepath",
-                    params(vec![("dir", "js"), ("filepath", "/inc/framework.js")]),
+                    Some(vec![("dir", "js"), ("filepath", "/inc/framework.js")]),
                 ),
-                TestRequest::new(
+                req(
                     "/info/gordon/public",
-                    false,
                     "/info/:user/public",
-                    params(vec![("user", "gordon")]),
+                    Some(vec![("user", "gordon")]),
                 ),
-                TestRequest::new(
+                req(
                     "/info/gordon/project/go",
-                    false,
                     "/info/:user/project/:project",
-                    params(vec![("user", "gordon"), ("project", "go")]),
+                    Some(vec![("user", "gordon"), ("project", "go")]),
+                ),
+                req(
+                    "/info/gordon/project/golang",
+                    "/info/:user/project/golang",
+                    Some(vec![("user", "gordon")]),
+                ),
+                req("/aa/aa", "/aa/*xx", Some(vec![("xx", "/aa")])),
+                req("/ab/ab", "/ab/*xx", Some(vec![("xx", "/ab")])),
+                req("/a", "/:cc", Some(vec![("cc", "a")])),
+                req("/all", "/:cc", Some(vec![("cc", "all")])),
+                req("/d", "/:cc", Some(vec![("cc", "d")])),
+                req("/ad", "/:cc", Some(vec![("cc", "ad")])),
+                req("/dd", "/:cc", Some(vec![("cc", "dd")])),
+                req("/dddaa", "/:cc", Some(vec![("cc", "dddaa")])),
+                req("/aa", "/:cc", Some(vec![("cc", "aa")])),
+                req("/aaa", "/:cc", Some(vec![("cc", "aaa")])),
+                req("/aaa/cc", "/:cc/cc", Some(vec![("cc", "aaa")])),
+                req("/ab", "/:cc", Some(vec![("cc", "ab")])),
+                req("/abb", "/:cc", Some(vec![("cc", "abb")])),
+                req("/abb/cc", "/:cc/cc", Some(vec![("cc", "abb")])),
+                req("/allxxxx", "/:cc", Some(vec![("cc", "allxxxx")])),
+                req("/alldd", "/:cc", Some(vec![("cc", "alldd")])),
+                req("/all/cc", "/:cc/cc", Some(vec![("cc", "all")])),
+                req("/a/cc", "/:cc/cc", Some(vec![("cc", "a")])),
+                req("/c1/d/e", "/c1/:dd/e", Some(vec![("dd", "d")])),
+                req("/c1/d/e1", "/c1/:dd/e1", Some(vec![("dd", "d")])),
+                req(
+                    "/c1/d/ee",
+                    "/:cc/:dd/ee",
+                    Some(vec![("cc", "c1"), ("dd", "d")]),
+                ),
+                req("/cc/cc", "/:cc/cc", Some(vec![("cc", "cc")])),
+                req("/ccc/cc", "/:cc/cc", Some(vec![("cc", "ccc")])),
+                req("/deedwjfs/cc", "/:cc/cc", Some(vec![("cc", "deedwjfs")])),
+                req("/acllcc/cc", "/:cc/cc", Some(vec![("cc", "acllcc")])),
+                req("/get/test/abc/", "/get/test/abc/", Some(vec![])),
+                req(
+                    "/get/te/abc/",
+                    "/get/:param/abc/",
+                    Some(vec![("param", "te")]),
+                ),
+                req(
+                    "/get/testaa/abc/",
+                    "/get/:param/abc/",
+                    Some(vec![("param", "testaa")]),
+                ),
+                req(
+                    "/get/xx/abc/",
+                    "/get/:param/abc/",
+                    Some(vec![("param", "xx")]),
+                ),
+                req(
+                    "/get/tt/abc/",
+                    "/get/:param/abc/",
+                    Some(vec![("param", "tt")]),
+                ),
+                req(
+                    "/get/a/abc/",
+                    "/get/:param/abc/",
+                    Some(vec![("param", "a")]),
+                ),
+                req(
+                    "/get/t/abc/",
+                    "/get/:param/abc/",
+                    Some(vec![("param", "t")]),
+                ),
+                req(
+                    "/get/aa/abc/",
+                    "/get/:param/abc/",
+                    Some(vec![("param", "aa")]),
+                ),
+                req(
+                    "/get/abas/abc/",
+                    "/get/:param/abc/",
+                    Some(vec![("param", "abas")]),
+                ),
+                req(
+                    "/something/secondthing/test",
+                    "/something/secondthing/test",
+                    Some(vec![]),
+                ),
+                req(
+                    "/something/abcdad/thirdthing",
+                    "/something/:paramname/thirdthing",
+                    Some(vec![("paramname", "abcdad")]),
+                ),
+                req(
+                    "/something/secondthingaaaa/thirdthing",
+                    "/something/:paramname/thirdthing",
+                    Some(vec![("paramname", "secondthingaaaa")]),
+                ),
+                req(
+                    "/something/se/thirdthing",
+                    "/something/:paramname/thirdthing",
+                    Some(vec![("paramname", "se")]),
+                ),
+                req(
+                    "/something/s/thirdthing",
+                    "/something/:paramname/thirdthing",
+                    Some(vec![("paramname", "s")]),
+                ),
+                req(
+                    "/c/d/ee",
+                    "/:cc/:dd/ee",
+                    Some(vec![("cc", "c"), ("dd", "d")]),
+                ),
+                req(
+                    "/c/d/e/ff",
+                    "/:cc/:dd/:ee/ff",
+                    Some(vec![("cc", "c"), ("dd", "d"), ("ee", "e")]),
+                ),
+                req(
+                    "/c/d/e/f/gg",
+                    "/:cc/:dd/:ee/:ff/gg",
+                    Some(vec![("cc", "c"), ("dd", "d"), ("ee", "e"), ("ff", "f")]),
+                ),
+                req(
+                    "/c/d/e/f/g/hh",
+                    "/:cc/:dd/:ee/:ff/:gg/hh",
+                    Some(vec![
+                        ("cc", "c"),
+                        ("dd", "d"),
+                        ("ee", "e"),
+                        ("ff", "f"),
+                        ("gg", "g"),
+                    ]),
+                ),
+                req(
+                    "/cc/dd/ee/ff/gg/hh",
+                    "/:cc/:dd/:ee/:ff/:gg/hh",
+                    Some(vec![
+                        ("cc", "cc"),
+                        ("dd", "dd"),
+                        ("ee", "ee"),
+                        ("ff", "ff"),
+                        ("gg", "gg"),
+                    ]),
+                ),
+                req("/get/abc", "/get/abc", Some(vec![])),
+                req("/get/a", "/get/:param", Some(vec![("param", "a")])),
+                req("/get/abz", "/get/:param", Some(vec![("param", "abz")])),
+                req("/get/12a", "/get/:param", Some(vec![("param", "12a")])),
+                req("/get/abcd", "/get/:param", Some(vec![("param", "abcd")])),
+                req("/get/abc/123abc", "/get/abc/123abc", Some(vec![])),
+                req(
+                    "/get/abc/12",
+                    "/get/abc/:param",
+                    Some(vec![("param", "12")]),
+                ),
+                req(
+                    "/get/abc/123ab",
+                    "/get/abc/:param",
+                    Some(vec![("param", "123ab")]),
+                ),
+                req(
+                    "/get/abc/xyz",
+                    "/get/abc/:param",
+                    Some(vec![("param", "xyz")]),
+                ),
+                req(
+                    "/get/abc/123abcddxx",
+                    "/get/abc/:param",
+                    Some(vec![("param", "123abcddxx")]),
+                ),
+                req("/get/abc/123abc/xxx8", "/get/abc/123abc/xxx8", Some(vec![])),
+                req(
+                    "/get/abc/123abc/x",
+                    "/get/abc/123abc/:param",
+                    Some(vec![("param", "x")]),
+                ),
+                req(
+                    "/get/abc/123abc/xxx",
+                    "/get/abc/123abc/:param",
+                    Some(vec![("param", "xxx")]),
+                ),
+                req(
+                    "/get/abc/123abc/abc",
+                    "/get/abc/123abc/:param",
+                    Some(vec![("param", "abc")]),
+                ),
+                req(
+                    "/get/abc/123abc/xxx8xxas",
+                    "/get/abc/123abc/:param",
+                    Some(vec![("param", "xxx8xxas")]),
+                ),
+                req(
+                    "/get/abc/123abc/xxx8/1234",
+                    "/get/abc/123abc/xxx8/1234",
+                    Some(vec![]),
+                ),
+                req(
+                    "/get/abc/123abc/xxx8/1",
+                    "/get/abc/123abc/xxx8/:param",
+                    Some(vec![("param", "1")]),
+                ),
+                req(
+                    "/get/abc/123abc/xxx8/123",
+                    "/get/abc/123abc/xxx8/:param",
+                    Some(vec![("param", "123")]),
+                ),
+                req(
+                    "/get/abc/123abc/xxx8/78k",
+                    "/get/abc/123abc/xxx8/:param",
+                    Some(vec![("param", "78k")]),
+                ),
+                req(
+                    "/get/abc/123abc/xxx8/1234xxxd",
+                    "/get/abc/123abc/xxx8/:param",
+                    Some(vec![("param", "1234xxxd")]),
+                ),
+                req(
+                    "/get/abc/123abc/xxx8/1234/ffas",
+                    "/get/abc/123abc/xxx8/1234/ffas",
+                    Some(vec![]),
+                ),
+                req(
+                    "/get/abc/123abc/xxx8/1234/f",
+                    "/get/abc/123abc/xxx8/1234/:param",
+                    Some(vec![("param", "f")]),
+                ),
+                req(
+                    "/get/abc/123abc/xxx8/1234/ffa",
+                    "/get/abc/123abc/xxx8/1234/:param",
+                    Some(vec![("param", "ffa")]),
+                ),
+                req(
+                    "/get/abc/123abc/xxx8/1234/kka",
+                    "/get/abc/123abc/xxx8/1234/:param",
+                    Some(vec![("param", "kka")]),
+                ),
+                req(
+                    "/get/abc/123abc/xxx8/1234/ffas321",
+                    "/get/abc/123abc/xxx8/1234/:param",
+                    Some(vec![("param", "ffas321")]),
+                ),
+                req(
+                    "/get/abc/123abc/xxx8/1234/kkdd/12c",
+                    "/get/abc/123abc/xxx8/1234/kkdd/12c",
+                    Some(vec![]),
+                ),
+                req(
+                    "/get/abc/123abc/xxx8/1234/kkdd/1",
+                    "/get/abc/123abc/xxx8/1234/kkdd/:param",
+                    Some(vec![("param", "1")]),
+                ),
+                req(
+                    "/get/abc/123abc/xxx8/1234/kkdd/12",
+                    "/get/abc/123abc/xxx8/1234/kkdd/:param",
+                    Some(vec![("param", "12")]),
+                ),
+                req(
+                    "/get/abc/123abc/xxx8/1234/kkdd/12b",
+                    "/get/abc/123abc/xxx8/1234/kkdd/:param",
+                    Some(vec![("param", "12b")]),
+                ),
+                req(
+                    "/get/abc/123abc/xxx8/1234/kkdd/34",
+                    "/get/abc/123abc/xxx8/1234/kkdd/:param",
+                    Some(vec![("param", "34")]),
+                ),
+                req(
+                    "/get/abc/123abc/xxx8/1234/kkdd/12c2e3",
+                    "/get/abc/123abc/xxx8/1234/kkdd/:param",
+                    Some(vec![("param", "12c2e3")]),
+                ),
+                req(
+                    "/get/abc/12/test",
+                    "/get/abc/:param/test",
+                    Some(vec![("param", "12")]),
+                ),
+                req(
+                    "/get/abc/123abdd/test",
+                    "/get/abc/:param/test",
+                    Some(vec![("param", "123abdd")]),
+                ),
+                req(
+                    "/get/abc/123abdddf/test",
+                    "/get/abc/:param/test",
+                    Some(vec![("param", "123abdddf")]),
+                ),
+                req(
+                    "/get/abc/123ab/test",
+                    "/get/abc/:param/test",
+                    Some(vec![("param", "123ab")]),
+                ),
+                req(
+                    "/get/abc/123abgg/test",
+                    "/get/abc/:param/test",
+                    Some(vec![("param", "123abgg")]),
+                ),
+                req(
+                    "/get/abc/123abff/test",
+                    "/get/abc/:param/test",
+                    Some(vec![("param", "123abff")]),
+                ),
+                req(
+                    "/get/abc/123abffff/test",
+                    "/get/abc/:param/test",
+                    Some(vec![("param", "123abffff")]),
+                ),
+                req(
+                    "/get/abc/123abd/test",
+                    "/get/abc/123abd/:param",
+                    Some(vec![("param", "test")]),
+                ),
+                req(
+                    "/get/abc/123abddd/test",
+                    "/get/abc/123abddd/:param",
+                    Some(vec![("param", "test")]),
+                ),
+                req(
+                    "/get/abc/123/test22",
+                    "/get/abc/123/:param",
+                    Some(vec![("param", "test22")]),
+                ),
+                req(
+                    "/get/abc/123abg/test",
+                    "/get/abc/123abg/:param",
+                    Some(vec![("param", "test")]),
+                ),
+                req(
+                    "/get/abc/123abf/testss",
+                    "/get/abc/123abf/:param",
+                    Some(vec![("param", "testss")]),
+                ),
+                req(
+                    "/get/abc/123abfff/te",
+                    "/get/abc/123abfff/:param",
+                    Some(vec![("param", "te")]),
                 ),
             ],
         );
@@ -1275,25 +1610,22 @@ mod tests {
         check_requests(
             &mut tree,
             vec![
-                TestRequest::new("/", false, "/", Params::new()),
-                TestRequest::new("/doc/", false, "/doc/", Params::new()),
-                TestRequest::new(
+                req("/", "/", Some(vec![])),
+                req("/doc/", "/doc/", Some(vec![])),
+                req(
                     "/src/some/file.png",
-                    false,
                     "/src/*filepath",
-                    params(vec![("filepath", "/some/file.png")]),
+                    Some(vec![("filepath", "/some/file.png")]),
                 ),
-                TestRequest::new(
+                req(
                     "/search/someth!ng+in+ünìcodé",
-                    false,
                     "/search/:query",
-                    params(vec![("query", "someth!ng+in+ünìcodé")]),
+                    Some(vec![("query", "someth!ng+in+ünìcodé")]),
                 ),
-                TestRequest::new(
+                req(
                     "/user_rustacean",
-                    false,
                     "/user_:name",
-                    params(vec![("name", "rustacean")]),
+                    Some(vec![("name", "rustacean")]),
                 ),
             ],
         );
