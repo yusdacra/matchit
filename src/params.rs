@@ -4,18 +4,18 @@ use std::slice;
 
 /// A single URL parameter, consisting of a key and a value.
 #[derive(Debug, PartialEq, Eq, Ord, PartialOrd, Default, Copy, Clone)]
-struct Param<'a> {
-    key: &'a [u8],
-    value: &'a [u8],
+struct Param<'k, 'v> {
+    key: &'k [u8],
+    value: &'v [u8],
 }
 
-impl<'a> Param<'a> {
+impl<'k, 'v> Param<'k, 'v> {
     // this could be from_utf8_unchecked, but we'll keep this safe for now
-    fn key_str(&self) -> &'a str {
+    fn key_str(&self) -> &'k str {
         std::str::from_utf8(self.key).unwrap()
     }
 
-    fn value_str(&self) -> &'a str {
+    fn value_str(&self) -> &'v str {
         std::str::from_utf8(self.value).unwrap()
     }
 }
@@ -40,21 +40,21 @@ impl<'a> Param<'a> {
 /// # }
 /// ```
 #[derive(Debug, PartialEq, Eq, Ord, PartialOrd, Clone)]
-pub struct Params<'a> {
-    kind: ParamsKind<'a>,
+pub struct Params<'k, 'v> {
+    kind: ParamsKind<'k, 'v>,
 }
 
 // most routes have 1-3 dynamic parameters, so we can avoid a heap allocation in common cases.
 const SMALL: usize = 3;
 
 #[derive(Debug, PartialEq, Eq, Ord, PartialOrd, Clone)]
-enum ParamsKind<'a> {
+enum ParamsKind<'k, 'v> {
     None,
-    Small([Param<'a>; SMALL], usize),
-    Large(Vec<Param<'a>>),
+    Small([Param<'k, 'v>; SMALL], usize),
+    Large(Vec<Param<'k, 'v>>),
 }
 
-impl<'a> Params<'a> {
+impl<'k, 'v> Params<'k, 'v> {
     pub(crate) fn new() -> Self {
         let kind = ParamsKind::None;
         Self { kind }
@@ -81,7 +81,7 @@ impl<'a> Params<'a> {
     }
 
     /// Returns the value of the first parameter registered under the given key.
-    pub fn get(&self, key: impl AsRef<str>) -> Option<&'a str> {
+    pub fn get(&self, key: impl AsRef<str>) -> Option<&'v str> {
         match &self.kind {
             ParamsKind::None => None,
             ParamsKind::Small(arr, len) => arr
@@ -97,7 +97,7 @@ impl<'a> Params<'a> {
     }
 
     /// Returns an iterator over the parameters in the list.
-    pub fn iter(&self) -> ParamsIter<'_, 'a> {
+    pub fn iter(&self) -> ParamsIter<'_, 'k, 'v> {
         ParamsIter::new(self)
     }
 
@@ -111,7 +111,7 @@ impl<'a> Params<'a> {
     }
 
     /// Inserts a key value parameter pair into the list.
-    pub(crate) fn push(&mut self, key: &'a [u8], value: &'a [u8]) {
+    pub(crate) fn push(&mut self, key: &'k [u8], value: &'v [u8]) {
         #[cold]
         fn drain_to_vec<T: Default>(len: usize, elem: T, arr: &mut [T; SMALL]) -> Vec<T> {
             let mut vec = Vec::with_capacity(len + 1);
@@ -139,12 +139,12 @@ impl<'a> Params<'a> {
 }
 
 /// An iterator over the keys and values of a route's [parameters](crate::Params).
-pub struct ParamsIter<'ps, 'a> {
-    kind: ParamsIterKind<'ps, 'a>,
+pub struct ParamsIter<'ps, 'k, 'v> {
+    kind: ParamsIterKind<'ps, 'k, 'v>,
 }
 
-impl<'ps, 'a> ParamsIter<'ps, 'a> {
-    fn new(params: &'ps Params<'a>) -> Self {
+impl<'ps, 'k, 'v> ParamsIter<'ps, 'k, 'v> {
+    fn new(params: &'ps Params<'k, 'v>) -> Self {
         let kind = match &params.kind {
             ParamsKind::None => ParamsIterKind::None,
             ParamsKind::Small(arr, len) => ParamsIterKind::Small(arr.iter().take(*len)),
@@ -154,14 +154,14 @@ impl<'ps, 'a> ParamsIter<'ps, 'a> {
     }
 }
 
-enum ParamsIterKind<'ps, 'a> {
+enum ParamsIterKind<'ps, 'k, 'v> {
     None,
-    Small(iter::Take<slice::Iter<'ps, Param<'a>>>),
-    Large(slice::Iter<'ps, Param<'a>>),
+    Small(iter::Take<slice::Iter<'ps, Param<'k, 'v>>>),
+    Large(slice::Iter<'ps, Param<'k, 'v>>),
 }
 
-impl<'ps, 'a> Iterator for ParamsIter<'ps, 'a> {
-    type Item = (&'a str, &'a str);
+impl<'ps, 'k, 'v> Iterator for ParamsIter<'ps, 'k, 'v> {
+    type Item = (&'k str, &'v str);
 
     fn next(&mut self) -> Option<Self::Item> {
         match self.kind {

@@ -8,11 +8,11 @@ use std::str;
 /// A successful match consisting of the registered value and the URL parameters, returned by
 /// [`Node::at`](crate::Node::at).
 #[derive(Debug)]
-pub struct Match<'a, V> {
+pub struct Match<'k, 'v, V> {
     /// The value stored under the matched node.
     pub value: V,
     /// The route parameters. See [parameters](crate#parameters) for more details.
-    pub params: Params<'a>,
+    pub params: Params<'k, 'v>,
 }
 
 /// The types of nodes the tree can hold
@@ -82,9 +82,9 @@ impl<T> Default for Node<T> {
 }
 
 #[derive(Clone)]
-struct Skipped<'a, T> {
-    path: &'a [u8],
-    node: &'a Node<T>,
+struct Skipped<'n, 'p, T> {
+    path: &'p [u8],
+    node: &'n Node<T>,
     params: usize,
 }
 
@@ -385,10 +385,7 @@ impl<T> Node<T> {
     /// # Ok(())
     /// # }
     /// ```
-    pub fn at<'a>(&'a self, path: &'a str) -> Result<Match<'a, &'a T>, MatchError>
-    where
-        Node<T>: Clone,
-    {
+    pub fn at<'n, 'p>(&'n self, path: &'p str) -> Result<Match<'n, 'p, &'n T>, MatchError> {
         match self.at_inner(path.as_bytes()) {
             Ok(v) => Ok(Match {
                 // SAFETY: We only expose unique references to value through &mut self
@@ -403,10 +400,10 @@ impl<T> Node<T> {
     /// Tries to find a value in the router matching the given path, and returns a mutable
     /// reference to it. If no value can be found it returns a trailing slash redirect
     /// recommendation, see [`tsr`](crate::MatchError::tsr).
-    pub fn at_mut<'a>(&'a mut self, path: &'a str) -> Result<Match<'a, &'a mut T>, MatchError>
-    where
-        Node<T>: Clone,
-    {
+    pub fn at_mut<'n, 'p>(
+        &'n mut self,
+        path: &'p str,
+    ) -> Result<Match<'n, 'p, &'n mut T>, MatchError> {
         match self.at_inner(path.as_bytes()) {
             Ok(v) => Ok(Match {
                 // SAFETY: We have a unique reference to self
@@ -420,18 +417,15 @@ impl<T> Node<T> {
     // It's a bit sad that we have to introduce unsafe here, but rust doesn't really have a way
     // to abstract over mutability, so it avoids having to duplicate logic between `at` and
     // `at_mut`.
-    fn at_inner<'a>(
-        &'a self,
-        full_path: &'a [u8],
-    ) -> Result<Match<'a, &'a UnsafeCell<T>>, MatchError>
-    where
-        Node<T>: Clone,
-    {
+    fn at_inner<'n, 'p>(
+        &'n self,
+        full_path: &'p [u8],
+    ) -> Result<Match<'n, 'p, &'n UnsafeCell<T>>, MatchError> {
         let mut current = self;
         let mut path = full_path;
         let mut params = Params::new();
 
-        let mut skipped_nodes: Option<Vec<Skipped<'a, T>>> = None;
+        let mut skipped_nodes: Option<Vec<Skipped<'_, '_, T>>> = None;
         let mut backtracking = false;
 
         'walk: loop {
@@ -909,7 +903,7 @@ fn find_wildcard(path: &[u8]) -> (Option<&[u8]>, Option<usize>, bool) {
 mod tests {
     use super::*;
 
-    fn params(vec: Vec<(&'static str, &'static str)>) -> Params<'static> {
+    fn params(vec: Vec<(&'static str, &'static str)>) -> Params<'static, 'static> {
         let mut params = Params::new();
         for (key, value) in vec {
             params.push(key.as_bytes(), value.as_bytes());
@@ -920,7 +914,7 @@ mod tests {
     struct TestRequest {
         path: &'static str,
         route: &'static str,
-        params: Option<Params<'static>>,
+        params: Option<Params<'static, 'static>>,
     }
 
     fn req(
