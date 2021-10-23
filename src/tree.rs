@@ -398,14 +398,15 @@ impl<T> Node<T> {
     // `at_mut`.
     fn at_inner<'n, 'p>(
         &'n self,
-        full_path: &'p [u8],
+        path: &'p [u8],
     ) -> Result<Match<'n, 'p, &'n UnsafeCell<T>>, MatchError> {
+        let full_path = path;
+
         let mut current = self;
         let mut path = full_path;
-        let mut params = Params::new();
-
-        let mut skipped_nodes: Option<Vec<Skipped<'_, '_, T>>> = None;
         let mut backtracking = false;
+        let mut params = Params::new();
+        let mut skipped_nodes: Option<Vec<Skipped<'_, '_, T>>> = None;
 
         'walk: loop {
             let prefix = &current.prefix;
