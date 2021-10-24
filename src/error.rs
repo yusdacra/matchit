@@ -1,21 +1,12 @@
 use std::fmt;
-use std::str;
+
+use super::Node;
 
 /// Represents errors that can occur when inserting a new route.
 #[non_exhaustive]
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum InsertError {
-    /// The inserted path conflicts with an existing route.
-    ///
-    /// This error may unexpectedly come up when registering routes like the following:
-    ///
-    /// ```text
-    /// /user/:id
-    /// /user/get
-    /// ```
-    ///
-    /// This is due to the strict requirements of the internal radix tree,
-    /// and should be fixed in the future.
+    /// The inserted route conflicts with an existing route.
     Conflict {
         /// The existing route that the insertion is conflicting with.
         with: String,
@@ -26,8 +17,8 @@ pub enum InsertError {
     UnnamedParam,
     /// Catch-all parameters are only allowed at the end of a path.
     InvalidCatchAll,
-    /// Invalid tokens in the inserted path.
-    MalformedPath,
+    /// Invalid tokens in the inserted route.
+    MalformedRoute,
 }
 
 impl fmt::Display for InsertError {
@@ -46,7 +37,7 @@ impl fmt::Display for InsertError {
                 f,
                 "catch-all parameters are only allowed at the end of a path"
             ),
-            Self::MalformedPath => write!(f, "malformed path"),
+            Self::MalformedRoute => write!(f, "malformed route"),
         }
     }
 }
@@ -54,18 +45,21 @@ impl fmt::Display for InsertError {
 impl std::error::Error for InsertError {}
 
 impl InsertError {
-    // TODO: make this more robust
-    pub(crate) fn conflict(path: &[u8], prefix: &[u8], current_prefix: &[u8]) -> Self {
-        fn try_get_conflict(path: &[u8], prefix: &[u8], current_prefix: &[u8]) -> Option<String> {
-            let path = str::from_utf8(path).ok()?;
-            let route = str::from_utf8(current_prefix).ok()?;
-            let prefix = str::from_utf8(prefix).ok()?;
-            let prefix = path.get(..path.rfind(prefix)?)?;
-            Some([prefix, route].join(""))
+    pub(crate) fn conflict<T>(route: &[u8], prefix: &[u8], current: &Node<T>) -> Self {
+        let mut route = route[..route.len() - prefix.len()].to_owned();
+
+        if !route.ends_with(&current.prefix) {
+            route.extend_from_slice(&current.prefix);
+        }
+
+        let mut current = current.children.first();
+        while let Some(node) = current {
+            route.extend_from_slice(&node.prefix);
+            current = node.children.first();
         }
 
         InsertError::Conflict {
-            with: try_get_conflict(path, prefix, current_prefix).unwrap_or("n/a".to_owned()),
+            with: String::from_utf8(route).unwrap(),
         }
     }
 }

@@ -33,11 +33,11 @@ enum NodeType {
 /// Priority is just the number of values registered in sub nodes
 /// (children, grandchildren, and so on..).
 pub struct Node<T> {
-    prefix: Vec<u8>,
+    pub(crate) prefix: Vec<u8>,
     wild_child: bool,
     node_type: NodeType,
     indices: Vec<u8>,
-    children: Vec<Self>,
+    pub(crate) children: Vec<Self>,
     // See `at_inner` for why an unsafe cell is needed.
     value: Option<UnsafeCell<T>>,
     priority: u32,
@@ -61,19 +61,13 @@ impl<T> Default for Node<T> {
     }
 }
 
-struct Skipped<'n, 'p, T> {
-    path: &'p [u8],
-    node: &'n Node<T>,
-    params: usize,
-}
-
 impl<T> Node<T> {
     /// Construct a new `Node`.
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// Register a value in the tree under the given path.
+    /// Register a value in the tree under the given route.
     /// ```rust
     /// # use matchit::Node;
     /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -83,15 +77,15 @@ impl<T> Node<T> {
     /// # Ok(())
     /// # }
     /// ```
-    pub fn insert(&mut self, path: impl Into<String>, val: T) -> Result<(), InsertError> {
-        let path = path.into().into_bytes();
-        let mut prefix = path.as_ref();
+    pub fn insert(&mut self, route: impl Into<String>, val: T) -> Result<(), InsertError> {
+        let route = route.into().into_bytes();
+        let mut prefix = route.as_ref();
 
         self.priority += 1;
 
         // Empty tree
         if self.prefix.is_empty() && self.children.is_empty() {
-            self.insert_child(&prefix, &path, val)?;
+            self.insert_child(&prefix, &route, val)?;
             self.node_type = NodeType::Root;
             return Ok(());
         }
@@ -176,15 +170,15 @@ impl<T> Node<T> {
                         continue 'walk;
                     }
 
-                    return Err(InsertError::conflict(&path, &prefix, &current.prefix));
+                    return Err(InsertError::conflict(&route, &prefix, &current));
                 }
 
-                return current.insert_child(prefix, &path, val);
+                return current.insert_child(prefix, &route, val);
             }
 
             // Otherwise add value to current node
             if current.value.is_some() {
-                return Err(InsertError::conflict(&path, &prefix, &current.prefix));
+                return Err(InsertError::conflict(&route, &prefix, &current));
             }
 
             current.value = Some(UnsafeCell::new(val));
@@ -202,7 +196,6 @@ impl<T> Node<T> {
             return len - 1;
         } else {
             self.children.push(child);
-            // TODO: len + 1
             return len;
         }
     }
@@ -235,12 +228,7 @@ impl<T> Node<T> {
         new_pos
     }
 
-    fn insert_child(
-        &mut self,
-        mut prefix: &[u8],
-        full_path: &[u8],
-        val: T,
-    ) -> Result<(), InsertError> {
+    fn insert_child(&mut self, mut prefix: &[u8], route: &[u8], val: T) -> Result<(), InsertError> {
         let mut current = self;
 
         loop {
@@ -284,8 +272,8 @@ impl<T> Node<T> {
                 current = &mut current.children[child];
                 current.priority += 1;
 
-                // If the path doesn't end with the wildcard, then there
-                // will be another non-wildcard subpath starting with '/'
+                // If the route doesn't end with the wildcard, then there
+                // will be another non-wildcard subroute starting with '/'
                 if wildcard.len() < prefix.len() {
                     prefix = &prefix[wildcard.len()..];
                     let child = Self {
@@ -309,13 +297,13 @@ impl<T> Node<T> {
             }
 
             if !current.prefix.is_empty() && current.prefix.last().copied() == Some(b'/') {
-                return Err(InsertError::conflict(&full_path, &prefix, &current.prefix));
+                return Err(InsertError::conflict(&route, &prefix, &current));
             }
 
             // Currently fixed width 1 for '/'
             wildcard_index = wildcard_index
                 .checked_sub(1)
-                .ok_or(InsertError::MalformedPath)?;
+                .ok_or(InsertError::MalformedRoute)?;
 
             if prefix[wildcard_index] != b'/' {
                 return Err(InsertError::InvalidCatchAll);
@@ -324,7 +312,7 @@ impl<T> Node<T> {
             current.prefix = prefix[..wildcard_index].to_owned();
             current.indices = vec![b'/'];
 
-            // first node: CatchAll Node with empty path
+            // first node: CatchAll Node with empty route
             let child = Self {
                 wild_child: true,
                 node_type: NodeType::CatchAll,
@@ -391,7 +379,35 @@ impl<T> Node<T> {
             Err(e) => Err(e),
         }
     }
+}
 
+struct Skipped<'n, 'p, T> {
+    path: &'p [u8],
+    node: &'n Node<T>,
+    params: usize,
+}
+
+#[rustfmt::skip]
+macro_rules! backtracker {
+    ($skipped_nodes:ident, $path:ident, $current:ident, $params:ident, $backtracking:ident, $walk:lifetime) => {
+        macro_rules! backtrack {
+            () => {
+                while let Some(skipped) = $skipped_nodes.pop() {
+                    if skipped.path.ends_with($path) {
+                        $path = skipped.path;
+                        $current = &skipped.node;
+                        $params.truncate(skipped.params);
+
+                        $backtracking = true;
+                        continue $walk;
+                    }
+                }
+            };
+        }
+    };
+}
+
+impl<T> Node<T> {
     // It's a bit sad that we have to introduce unsafe here, but rust doesn't really have a way
     // to abstract over mutability, so it avoids having to duplicate logic between `at` and
     // `at_mut`.
@@ -405,13 +421,14 @@ impl<T> Node<T> {
         let mut path = full_path;
         let mut backtracking = false;
         let mut params = Params::new();
-        let mut skipped_nodes: Option<Vec<Skipped<'_, '_, T>>> = None;
+        let mut skipped_nodes: Vec<Skipped<'_, '_, _>> = Vec::new();
 
         'walk: loop {
-            let prefix = &current.prefix;
-            if path.len() > prefix.len() {
-                if prefix == &path[..prefix.len()] {
-                    path = &path[prefix.len()..];
+            backtracker!(skipped_nodes, path, current, params, backtracking, 'walk);
+
+            if path.len() > current.prefix.len() {
+                if current.prefix == &path[..current.prefix.len()] {
+                    path = &path[current.prefix.len()..];
 
                     let idx = path[0];
 
@@ -419,14 +436,12 @@ impl<T> Node<T> {
                     if !backtracking {
                         if let Some(i) = current.indices.iter().position(|&c| c == idx) {
                             if current.wild_child {
-                                skipped_nodes
-                                    .get_or_insert_with(Default::default)
-                                    .push(Skipped {
-                                        path: &full_path
-                                            [full_path.len() - (prefix.len() + path.len())..],
-                                        node: &current,
-                                        params: params.len(),
-                                    });
+                                skipped_nodes.push(Skipped {
+                                    path: &full_path
+                                        [full_path.len() - (current.prefix.len() + path.len())..],
+                                    node: &current,
+                                    params: params.len(),
+                                });
                             }
                             current = &current.children[i];
                             continue 'walk;
@@ -434,18 +449,7 @@ impl<T> Node<T> {
                     }
 
                     if path != b"/" && !current.wild_child {
-                        if let Some(skipped_nodes) = &mut skipped_nodes {
-                            while let Some(skipped) = skipped_nodes.pop() {
-                                if skipped.path.ends_with(path) {
-                                    path = skipped.path;
-                                    current = &skipped.node;
-                                    params.truncate(skipped.params);
-
-                                    backtracking = true;
-                                    continue 'walk;
-                                }
-                            }
-                        }
+                        backtrack!();
                     }
 
                     // If there is no wildcard pattern, recommend a redirection
@@ -509,20 +513,9 @@ impl<T> Node<T> {
                 }
             }
 
-            if path == prefix {
+            if path == current.prefix {
                 if current.value.is_none() && path != b"/" {
-                    if let Some(skipped_nodes) = &mut skipped_nodes {
-                        while let Some(skipped) = skipped_nodes.pop() {
-                            if skipped.path.ends_with(path) {
-                                path = skipped.path;
-                                current = &skipped.node;
-                                params.truncate(skipped.params);
-
-                                backtracking = true;
-                                continue 'walk;
-                            }
-                        }
-                    }
+                    backtrack!();
                 }
 
                 // We should have reached the node containing the value.
@@ -554,23 +547,13 @@ impl<T> Node<T> {
             }
 
             if path != b"/" {
-                if let Some(skipped_nodes) = &mut skipped_nodes {
-                    while let Some(skipped) = skipped_nodes.pop() {
-                        if skipped.path.ends_with(path) {
-                            path = skipped.path;
-                            current = &skipped.node;
-                            params.truncate(skipped.params);
-
-                            backtracking = true;
-                            continue 'walk;
-                        }
-                    }
-                }
+                backtrack!();
             }
 
             // Nothing found. We can recommend to redirect to the same URL with an
             // extra trailing slash if a leaf exists for that path
-            let tsr = (path == b"/") || (prefix.len() == path.len() + 1 && current.value.is_some());
+            let tsr = (path == b"/")
+                || (current.prefix.len() == path.len() + 1 && current.value.is_some());
             return Err(MatchError::new(tsr));
         }
     }
@@ -836,6 +819,24 @@ impl<T> Node<T> {
             _ => unreachable!(),
         }
     }
+
+    #[cfg(feature = "__test_helpers")]
+    pub fn check_priorities(&self) -> Result<u32, (u32, u32)> {
+        let mut priority: u32 = 0;
+        for child in &self.children {
+            priority += child.check_priorities()?;
+        }
+
+        if self.value.is_some() {
+            priority += 1;
+        }
+
+        if self.priority != priority {
+            return Err((self.priority, priority));
+        }
+
+        Ok(priority)
+    }
 }
 
 // Shift bytes in array by n bytes left
@@ -846,10 +847,7 @@ pub const fn shift_n_bytes(bytes: [u8; 4], n: usize) -> [u8; 4] {
     }
 }
 
-// This function is ported from go.
-// Reports whether the byte could be the first byte of an encoded,
-// possibly invalid char. Second and subsequent bytes always have
-// the top two bits set to 10.
+// Reports whether the byte could be the first byte of a `char`.
 const fn char_start(b: u8) -> bool {
     b & 0xC0 != 0x80
 }
@@ -873,1103 +871,8 @@ fn find_wildcard(path: &[u8]) -> (Option<&[u8]>, Option<usize>, bool) {
                 _ => (),
             };
         }
+
         return (Some(&path[start..]), Some(start), valid);
     }
     (None, None, false)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn params(vec: Vec<(&'static str, &'static str)>) -> Params<'static, 'static> {
-        let mut params = Params::new();
-        for (key, value) in vec {
-            params.push(key.as_bytes(), value.as_bytes());
-        }
-        params
-    }
-
-    struct TestRequest {
-        path: &'static str,
-        route: &'static str,
-        params: Option<Params<'static, 'static>>,
-    }
-
-    fn req(
-        path: &'static str,
-        route: &'static str,
-        vec: Option<Vec<(&'static str, &'static str)>>,
-    ) -> TestRequest {
-        TestRequest {
-            path,
-            route,
-            params: vec.map(params),
-        }
-    }
-
-    fn check_requests(tree: &mut Node<String>, requests: Vec<TestRequest>) {
-        for request in requests {
-            let res = tree.at(request.path);
-
-            match res {
-                Err(_) => {
-                    if request.params.is_some() {
-                        panic!("Expected non-nil value for route '{}'", request.path);
-                    }
-                }
-                Ok(result) => {
-                    match request.params {
-                        Some(expected_params) => {
-                            if result.value != request.route {
-                                panic!(
-                                    "Wrong value for route '{}'. Expected '{}', found '{}')",
-                                    request.path, result.value, request.route
-                                );
-                            }
-
-                            assert_eq!(
-                                result.params, expected_params,
-                                "Wrong params for route '{}'",
-                                request.path
-                            );
-
-                            // test at_mut
-                            let res_mut = tree.at_mut(request.path).unwrap();
-                            res_mut.value.push_str("CHECKED");
-
-                            let res = tree.at(request.path).unwrap();
-                            assert!(res.value.contains("CHECKED"));
-
-                            let res_mut = tree.at_mut(request.path).unwrap();
-                            *res_mut.value = res_mut.value.replace("CHECKED", "");
-                        }
-
-                        None => {
-                            panic!(
-                                "Expected nil value for route '{}', got: {:?}",
-                                request.path,
-                                result.params.iter().collect::<Vec<_>>()
-                            );
-                        }
-                    }
-                }
-            };
-        }
-    }
-
-    fn check_priorities(n: &mut Node<String>) -> u32 {
-        let mut prio: u32 = 0;
-        for i in 0..n.children.len() {
-            prio += check_priorities(&mut n.children[i]);
-        }
-
-        if n.value.is_some() {
-            prio += 1;
-        }
-
-        if n.priority != prio {
-            panic!(
-                "priority mismatch for node '{}': found '{}', expected '{}'",
-                str::from_utf8(&n.prefix).unwrap(),
-                n.priority,
-                prio
-            )
-        }
-
-        prio
-    }
-
-    #[test]
-    fn test_tree_add_and_get() {
-        let mut tree = Node::new();
-
-        let routes = vec![
-            "/hi",
-            "/contact",
-            "/co",
-            "/c",
-            "/a",
-            "/ab",
-            "/doc/",
-            "/doc/go_faq.html",
-            "/doc/go1.html",
-            "/ʯ",
-            "/β",
-        ];
-
-        for route in routes {
-            tree.insert(route, route.to_owned()).unwrap();
-        }
-
-        check_requests(
-            &mut tree,
-            vec![
-                req("/a", "/a", Some(vec![])),
-                req("/", "", None),
-                req("/hi", "/hi", Some(vec![])),
-                req("/contact", "/contact", Some(vec![])),
-                req("/co", "/co", Some(vec![])),
-                req("/con", "", None),  // key mismatch
-                req("/cona", "", None), // key mismatch
-                req("/no", "", None),   // no matching child
-                req("/ab", "/ab", Some(vec![])),
-                req("/ʯ", "/ʯ", Some(vec![])),
-                req("/β", "/β", Some(vec![])),
-            ],
-        );
-
-        check_priorities(&mut tree);
-    }
-
-    #[test]
-    fn test_tree_wildcard() {
-        let mut tree = Node::new();
-
-        let routes = vec![
-            "/",
-            "/cmd/:tool/",
-            "/cmd/:tool/:sub",
-            "/cmd/whoami",
-            "/cmd/whoami/root",
-            "/cmd/whoami/root/",
-            "/src/*filepath",
-            "/search/",
-            "/search/:query",
-            "/search/gin-gonic",
-            "/search/google",
-            "/user_:name",
-            "/user_:name/about",
-            "/files/:dir/*filepath",
-            "/doc/",
-            "/doc/go_faq.html",
-            "/doc/go1.html",
-            "/info/:user/public",
-            "/info/:user/project/:project",
-            "/info/:user/project/golang",
-            "/aa/*xx",
-            "/ab/*xx",
-            "/:cc",
-            "/c1/:dd/e",
-            "/c1/:dd/e1",
-            "/:cc/cc",
-            "/:cc/:dd/ee",
-            "/:cc/:dd/:ee/ff",
-            "/:cc/:dd/:ee/:ff/gg",
-            "/:cc/:dd/:ee/:ff/:gg/hh",
-            "/get/test/abc/",
-            "/get/:param/abc/",
-            "/something/:paramname/thirdthing",
-            "/something/secondthing/test",
-            "/get/abc",
-            "/get/:param",
-            "/get/abc/123abc",
-            "/get/abc/:param",
-            "/get/abc/123abc/xxx8",
-            "/get/abc/123abc/:param",
-            "/get/abc/123abc/xxx8/1234",
-            "/get/abc/123abc/xxx8/:param",
-            "/get/abc/123abc/xxx8/1234/ffas",
-            "/get/abc/123abc/xxx8/1234/:param",
-            "/get/abc/123abc/xxx8/1234/kkdd/12c",
-            "/get/abc/123abc/xxx8/1234/kkdd/:param",
-            "/get/abc/:param/test",
-            "/get/abc/123abd/:param",
-            "/get/abc/123abddd/:param",
-            "/get/abc/123/:param",
-            "/get/abc/123abg/:param",
-            "/get/abc/123abf/:param",
-            "/get/abc/123abfff/:param",
-        ];
-
-        for route in routes {
-            tree.insert(route, route.to_owned()).unwrap();
-        }
-
-        check_requests(
-            &mut tree,
-            vec![
-                req("/", "/", Some(vec![])),
-                req("/cmd/test", "/cmd/:tool/", None),
-                req("/cmd/test/", "/cmd/:tool/", Some(vec![("tool", "test")])),
-                req(
-                    "/cmd/test/3",
-                    "/cmd/:tool/:sub",
-                    Some(vec![("tool", "test"), ("sub", "3")]),
-                ),
-                req("/cmd/who", "/cmd/:tool/", None),
-                req("/cmd/who/", "/cmd/:tool/", Some(vec![("tool", "who")])),
-                req("/cmd/whoami", "/cmd/whoami", Some(vec![])),
-                req("/cmd/whoami/", "/cmd/whoami", None),
-                req(
-                    "/cmd/whoami/r",
-                    "/cmd/:tool/:sub",
-                    Some(vec![("tool", "whoami"), ("sub", "r")]),
-                ),
-                req("/cmd/whoami/r/", "/cmd/:tool/:sub", None),
-                req("/cmd/whoami/root", "/cmd/whoami/root", Some(vec![])),
-                req("/cmd/whoami/root/", "/cmd/whoami/root/", Some(vec![])),
-                req("/src/", "/src/*filepath", Some(vec![("filepath", "/")])),
-                req(
-                    "/src/some/file.png",
-                    "/src/*filepath",
-                    Some(vec![("filepath", "/some/file.png")]),
-                ),
-                req("/search/", "/search/", Some(vec![])),
-                req(
-                    "/search/someth!ng+in+ünìcodé",
-                    "/search/:query",
-                    Some(vec![("query", "someth!ng+in+ünìcodé")]),
-                ),
-                req("/search/someth!ng+in+ünìcodé/", "", None),
-                req(
-                    "/user_rustacean",
-                    "/user_:name",
-                    Some(vec![("name", "rustacean")]),
-                ),
-                req(
-                    "/user_rustacean/about",
-                    "/user_:name/about",
-                    Some(vec![("name", "rustacean")]),
-                ),
-                req(
-                    "/files/js/inc/framework.js",
-                    "/files/:dir/*filepath",
-                    Some(vec![("dir", "js"), ("filepath", "/inc/framework.js")]),
-                ),
-                req(
-                    "/info/gordon/public",
-                    "/info/:user/public",
-                    Some(vec![("user", "gordon")]),
-                ),
-                req(
-                    "/info/gordon/project/go",
-                    "/info/:user/project/:project",
-                    Some(vec![("user", "gordon"), ("project", "go")]),
-                ),
-                req(
-                    "/info/gordon/project/golang",
-                    "/info/:user/project/golang",
-                    Some(vec![("user", "gordon")]),
-                ),
-                req("/aa/aa", "/aa/*xx", Some(vec![("xx", "/aa")])),
-                req("/ab/ab", "/ab/*xx", Some(vec![("xx", "/ab")])),
-                req("/a", "/:cc", Some(vec![("cc", "a")])),
-                req("/all", "/:cc", Some(vec![("cc", "all")])),
-                req("/d", "/:cc", Some(vec![("cc", "d")])),
-                req("/ad", "/:cc", Some(vec![("cc", "ad")])),
-                req("/dd", "/:cc", Some(vec![("cc", "dd")])),
-                req("/dddaa", "/:cc", Some(vec![("cc", "dddaa")])),
-                req("/aa", "/:cc", Some(vec![("cc", "aa")])),
-                req("/aaa", "/:cc", Some(vec![("cc", "aaa")])),
-                req("/aaa/cc", "/:cc/cc", Some(vec![("cc", "aaa")])),
-                req("/ab", "/:cc", Some(vec![("cc", "ab")])),
-                req("/abb", "/:cc", Some(vec![("cc", "abb")])),
-                req("/abb/cc", "/:cc/cc", Some(vec![("cc", "abb")])),
-                req("/allxxxx", "/:cc", Some(vec![("cc", "allxxxx")])),
-                req("/alldd", "/:cc", Some(vec![("cc", "alldd")])),
-                req("/all/cc", "/:cc/cc", Some(vec![("cc", "all")])),
-                req("/a/cc", "/:cc/cc", Some(vec![("cc", "a")])),
-                req("/c1/d/e", "/c1/:dd/e", Some(vec![("dd", "d")])),
-                req("/c1/d/e1", "/c1/:dd/e1", Some(vec![("dd", "d")])),
-                req(
-                    "/c1/d/ee",
-                    "/:cc/:dd/ee",
-                    Some(vec![("cc", "c1"), ("dd", "d")]),
-                ),
-                req("/cc/cc", "/:cc/cc", Some(vec![("cc", "cc")])),
-                req("/ccc/cc", "/:cc/cc", Some(vec![("cc", "ccc")])),
-                req("/deedwjfs/cc", "/:cc/cc", Some(vec![("cc", "deedwjfs")])),
-                req("/acllcc/cc", "/:cc/cc", Some(vec![("cc", "acllcc")])),
-                req("/get/test/abc/", "/get/test/abc/", Some(vec![])),
-                req(
-                    "/get/te/abc/",
-                    "/get/:param/abc/",
-                    Some(vec![("param", "te")]),
-                ),
-                req(
-                    "/get/testaa/abc/",
-                    "/get/:param/abc/",
-                    Some(vec![("param", "testaa")]),
-                ),
-                req(
-                    "/get/xx/abc/",
-                    "/get/:param/abc/",
-                    Some(vec![("param", "xx")]),
-                ),
-                req(
-                    "/get/tt/abc/",
-                    "/get/:param/abc/",
-                    Some(vec![("param", "tt")]),
-                ),
-                req(
-                    "/get/a/abc/",
-                    "/get/:param/abc/",
-                    Some(vec![("param", "a")]),
-                ),
-                req(
-                    "/get/t/abc/",
-                    "/get/:param/abc/",
-                    Some(vec![("param", "t")]),
-                ),
-                req(
-                    "/get/aa/abc/",
-                    "/get/:param/abc/",
-                    Some(vec![("param", "aa")]),
-                ),
-                req(
-                    "/get/abas/abc/",
-                    "/get/:param/abc/",
-                    Some(vec![("param", "abas")]),
-                ),
-                req(
-                    "/something/secondthing/test",
-                    "/something/secondthing/test",
-                    Some(vec![]),
-                ),
-                req(
-                    "/something/abcdad/thirdthing",
-                    "/something/:paramname/thirdthing",
-                    Some(vec![("paramname", "abcdad")]),
-                ),
-                req(
-                    "/something/secondthingaaaa/thirdthing",
-                    "/something/:paramname/thirdthing",
-                    Some(vec![("paramname", "secondthingaaaa")]),
-                ),
-                req(
-                    "/something/se/thirdthing",
-                    "/something/:paramname/thirdthing",
-                    Some(vec![("paramname", "se")]),
-                ),
-                req(
-                    "/something/s/thirdthing",
-                    "/something/:paramname/thirdthing",
-                    Some(vec![("paramname", "s")]),
-                ),
-                req(
-                    "/c/d/ee",
-                    "/:cc/:dd/ee",
-                    Some(vec![("cc", "c"), ("dd", "d")]),
-                ),
-                req(
-                    "/c/d/e/ff",
-                    "/:cc/:dd/:ee/ff",
-                    Some(vec![("cc", "c"), ("dd", "d"), ("ee", "e")]),
-                ),
-                req(
-                    "/c/d/e/f/gg",
-                    "/:cc/:dd/:ee/:ff/gg",
-                    Some(vec![("cc", "c"), ("dd", "d"), ("ee", "e"), ("ff", "f")]),
-                ),
-                req(
-                    "/c/d/e/f/g/hh",
-                    "/:cc/:dd/:ee/:ff/:gg/hh",
-                    Some(vec![
-                        ("cc", "c"),
-                        ("dd", "d"),
-                        ("ee", "e"),
-                        ("ff", "f"),
-                        ("gg", "g"),
-                    ]),
-                ),
-                req(
-                    "/cc/dd/ee/ff/gg/hh",
-                    "/:cc/:dd/:ee/:ff/:gg/hh",
-                    Some(vec![
-                        ("cc", "cc"),
-                        ("dd", "dd"),
-                        ("ee", "ee"),
-                        ("ff", "ff"),
-                        ("gg", "gg"),
-                    ]),
-                ),
-                req("/get/abc", "/get/abc", Some(vec![])),
-                req("/get/a", "/get/:param", Some(vec![("param", "a")])),
-                req("/get/abz", "/get/:param", Some(vec![("param", "abz")])),
-                req("/get/12a", "/get/:param", Some(vec![("param", "12a")])),
-                req("/get/abcd", "/get/:param", Some(vec![("param", "abcd")])),
-                req("/get/abc/123abc", "/get/abc/123abc", Some(vec![])),
-                req(
-                    "/get/abc/12",
-                    "/get/abc/:param",
-                    Some(vec![("param", "12")]),
-                ),
-                req(
-                    "/get/abc/123ab",
-                    "/get/abc/:param",
-                    Some(vec![("param", "123ab")]),
-                ),
-                req(
-                    "/get/abc/xyz",
-                    "/get/abc/:param",
-                    Some(vec![("param", "xyz")]),
-                ),
-                req(
-                    "/get/abc/123abcddxx",
-                    "/get/abc/:param",
-                    Some(vec![("param", "123abcddxx")]),
-                ),
-                req("/get/abc/123abc/xxx8", "/get/abc/123abc/xxx8", Some(vec![])),
-                req(
-                    "/get/abc/123abc/x",
-                    "/get/abc/123abc/:param",
-                    Some(vec![("param", "x")]),
-                ),
-                req(
-                    "/get/abc/123abc/xxx",
-                    "/get/abc/123abc/:param",
-                    Some(vec![("param", "xxx")]),
-                ),
-                req(
-                    "/get/abc/123abc/abc",
-                    "/get/abc/123abc/:param",
-                    Some(vec![("param", "abc")]),
-                ),
-                req(
-                    "/get/abc/123abc/xxx8xxas",
-                    "/get/abc/123abc/:param",
-                    Some(vec![("param", "xxx8xxas")]),
-                ),
-                req(
-                    "/get/abc/123abc/xxx8/1234",
-                    "/get/abc/123abc/xxx8/1234",
-                    Some(vec![]),
-                ),
-                req(
-                    "/get/abc/123abc/xxx8/1",
-                    "/get/abc/123abc/xxx8/:param",
-                    Some(vec![("param", "1")]),
-                ),
-                req(
-                    "/get/abc/123abc/xxx8/123",
-                    "/get/abc/123abc/xxx8/:param",
-                    Some(vec![("param", "123")]),
-                ),
-                req(
-                    "/get/abc/123abc/xxx8/78k",
-                    "/get/abc/123abc/xxx8/:param",
-                    Some(vec![("param", "78k")]),
-                ),
-                req(
-                    "/get/abc/123abc/xxx8/1234xxxd",
-                    "/get/abc/123abc/xxx8/:param",
-                    Some(vec![("param", "1234xxxd")]),
-                ),
-                req(
-                    "/get/abc/123abc/xxx8/1234/ffas",
-                    "/get/abc/123abc/xxx8/1234/ffas",
-                    Some(vec![]),
-                ),
-                req(
-                    "/get/abc/123abc/xxx8/1234/f",
-                    "/get/abc/123abc/xxx8/1234/:param",
-                    Some(vec![("param", "f")]),
-                ),
-                req(
-                    "/get/abc/123abc/xxx8/1234/ffa",
-                    "/get/abc/123abc/xxx8/1234/:param",
-                    Some(vec![("param", "ffa")]),
-                ),
-                req(
-                    "/get/abc/123abc/xxx8/1234/kka",
-                    "/get/abc/123abc/xxx8/1234/:param",
-                    Some(vec![("param", "kka")]),
-                ),
-                req(
-                    "/get/abc/123abc/xxx8/1234/ffas321",
-                    "/get/abc/123abc/xxx8/1234/:param",
-                    Some(vec![("param", "ffas321")]),
-                ),
-                req(
-                    "/get/abc/123abc/xxx8/1234/kkdd/12c",
-                    "/get/abc/123abc/xxx8/1234/kkdd/12c",
-                    Some(vec![]),
-                ),
-                req(
-                    "/get/abc/123abc/xxx8/1234/kkdd/1",
-                    "/get/abc/123abc/xxx8/1234/kkdd/:param",
-                    Some(vec![("param", "1")]),
-                ),
-                req(
-                    "/get/abc/123abc/xxx8/1234/kkdd/12",
-                    "/get/abc/123abc/xxx8/1234/kkdd/:param",
-                    Some(vec![("param", "12")]),
-                ),
-                req(
-                    "/get/abc/123abc/xxx8/1234/kkdd/12b",
-                    "/get/abc/123abc/xxx8/1234/kkdd/:param",
-                    Some(vec![("param", "12b")]),
-                ),
-                req(
-                    "/get/abc/123abc/xxx8/1234/kkdd/34",
-                    "/get/abc/123abc/xxx8/1234/kkdd/:param",
-                    Some(vec![("param", "34")]),
-                ),
-                req(
-                    "/get/abc/123abc/xxx8/1234/kkdd/12c2e3",
-                    "/get/abc/123abc/xxx8/1234/kkdd/:param",
-                    Some(vec![("param", "12c2e3")]),
-                ),
-                req(
-                    "/get/abc/12/test",
-                    "/get/abc/:param/test",
-                    Some(vec![("param", "12")]),
-                ),
-                req(
-                    "/get/abc/123abdd/test",
-                    "/get/abc/:param/test",
-                    Some(vec![("param", "123abdd")]),
-                ),
-                req(
-                    "/get/abc/123abdddf/test",
-                    "/get/abc/:param/test",
-                    Some(vec![("param", "123abdddf")]),
-                ),
-                req(
-                    "/get/abc/123ab/test",
-                    "/get/abc/:param/test",
-                    Some(vec![("param", "123ab")]),
-                ),
-                req(
-                    "/get/abc/123abgg/test",
-                    "/get/abc/:param/test",
-                    Some(vec![("param", "123abgg")]),
-                ),
-                req(
-                    "/get/abc/123abff/test",
-                    "/get/abc/:param/test",
-                    Some(vec![("param", "123abff")]),
-                ),
-                req(
-                    "/get/abc/123abffff/test",
-                    "/get/abc/:param/test",
-                    Some(vec![("param", "123abffff")]),
-                ),
-                req(
-                    "/get/abc/123abd/test",
-                    "/get/abc/123abd/:param",
-                    Some(vec![("param", "test")]),
-                ),
-                req(
-                    "/get/abc/123abddd/test",
-                    "/get/abc/123abddd/:param",
-                    Some(vec![("param", "test")]),
-                ),
-                req(
-                    "/get/abc/123/test22",
-                    "/get/abc/123/:param",
-                    Some(vec![("param", "test22")]),
-                ),
-                req(
-                    "/get/abc/123abg/test",
-                    "/get/abc/123abg/:param",
-                    Some(vec![("param", "test")]),
-                ),
-                req(
-                    "/get/abc/123abf/testss",
-                    "/get/abc/123abf/:param",
-                    Some(vec![("param", "testss")]),
-                ),
-                req(
-                    "/get/abc/123abfff/te",
-                    "/get/abc/123abfff/:param",
-                    Some(vec![("param", "te")]),
-                ),
-            ],
-        );
-
-        check_priorities(&mut tree);
-    }
-
-    type TestRoute = (&'static str, bool);
-
-    fn test_routes(routes: Vec<TestRoute>) {
-        let mut tree = Node::new();
-
-        for route in routes {
-            let res = tree.insert(route.0, ());
-
-            if route.1 {
-                if res.is_ok() {
-                    panic!("no panic for conflicting route '{}'", route.1);
-                }
-            } else if res.is_err() {
-                panic!("unexpected panic for route '{}': {:?}", route.0, res);
-            }
-        }
-    }
-
-    #[test]
-    fn test_tree_wildcard_conflict() {
-        let routes = vec![
-            ("/cmd/:tool/:sub", false),
-            ("/cmd/vet", false),
-            ("/foo/bar", false),
-            ("/foo/:name", false),
-            ("/foo/:names", true),
-            ("/cmd/*path", true),
-            ("/cmd/:badvar", true),
-            ("/cmd/:tool/names", false),
-            ("/cmd/:tool/:badsub/details", true),
-            ("/src/*filepath", false),
-            ("/src/:file", true),
-            ("/src/static.json", true),
-            ("/src/*filepathx", true),
-            ("/src/", true),
-            ("/src/foo/bar", true),
-            ("/src1/", false),
-            ("/src1/*filepath", true),
-            ("/src2*filepath", true),
-            ("/src2/*filepath", false),
-            ("/search/:query", false),
-            ("/search/valid", false),
-            ("/user_:name", false),
-            ("/user_x", false),
-            ("/user_:name", true),
-            ("/id:id", false),
-            ("/id/:id", false),
-        ];
-
-        test_routes(routes);
-    }
-
-    #[test]
-    fn test_catchall_after_slash() {
-        let routes = vec![("/non-leading-*catchall", true)];
-
-        test_routes(routes);
-    }
-
-    #[test]
-    fn test_tree_child_conflict() {
-        let routes = vec![
-            ("/cmd/vet", false),
-            ("/cmd/:tool", false),
-            ("/cmd/:tool/:sub", false),
-            ("/cmd/:tool/misc", false),
-            ("/cmd/:tool/:othersub", true),
-            ("/src/AUTHORS", false),
-            ("/src/*filepath", true),
-            ("/user_x", false),
-            ("/user_:name", false),
-            ("/id/:id", false),
-            ("/id:id", false),
-            ("/:id", false),
-            ("/*filepath", true),
-        ];
-
-        test_routes(routes);
-    }
-
-    #[test]
-    fn test_tree_duplicate_path() {
-        let mut tree = Node::new();
-
-        let routes = vec![
-            "/",
-            "/doc/",
-            "/src/*filepath",
-            "/search/:query",
-            "/user_:name",
-        ];
-
-        for route in routes {
-            tree.insert(route, route.to_owned()).unwrap();
-            let res = tree.insert(route, route.to_owned());
-            assert_eq!(res, Err(InsertError::Conflict { with: route.into() }));
-        }
-
-        check_requests(
-            &mut tree,
-            vec![
-                req("/", "/", Some(vec![])),
-                req("/doc/", "/doc/", Some(vec![])),
-                req(
-                    "/src/some/file.png",
-                    "/src/*filepath",
-                    Some(vec![("filepath", "/some/file.png")]),
-                ),
-                req(
-                    "/search/someth!ng+in+ünìcodé",
-                    "/search/:query",
-                    Some(vec![("query", "someth!ng+in+ünìcodé")]),
-                ),
-                req(
-                    "/user_rustacean",
-                    "/user_:name",
-                    Some(vec![("name", "rustacean")]),
-                ),
-            ],
-        );
-    }
-
-    #[test]
-    fn test_empty_wildcard_name() {
-        let mut tree = Node::new();
-        let routes = vec!["/user:", "/user:/", "/cmd/:/", "/src/*"];
-
-        for route in routes {
-            assert_eq!(
-                tree.insert(route, route.to_owned()),
-                Err(InsertError::UnnamedParam)
-            );
-        }
-    }
-
-    #[test]
-    fn test_tree_catch_all_conflict() {
-        let routes = vec![
-            ("/src/*filepath/x", true),
-            ("/src2/", false),
-            ("/src2/*filepath/x", true),
-        ];
-
-        test_routes(routes);
-    }
-
-    #[test]
-    fn test_tree_catch_all_conflict_root() {
-        let routes = vec![("/", false), ("/*filepath", true)];
-
-        test_routes(routes);
-    }
-
-    #[test]
-    fn test_tree_double_wildcard() {
-        let routes = vec!["/:foo:bar", "/:foo:bar/", "/:foo*bar"];
-
-        for route in routes {
-            let mut tree = Node::new();
-            let res = tree.insert(route, route.to_owned());
-            assert_eq!(res, Err(InsertError::TooManyParams));
-        }
-    }
-
-    #[test]
-    fn test_tree_trailing_slash_redirect() {
-        let mut tree = Node::new();
-        let routes = vec![
-            "/hi",
-            "/b/",
-            "/search/:query",
-            "/cmd/:tool/",
-            "/src/*filepath",
-            "/x",
-            "/x/y",
-            "/y/",
-            "/y/z",
-            "/0/:id",
-            "/0/:id/1",
-            "/1/:id/",
-            "/1/:id/2",
-            "/aa",
-            "/a/",
-            "/admin",
-            "/admin/:category",
-            "/admin/:category/:page",
-            "/doc",
-            "/doc/go_faq.html",
-            "/doc/go1.html",
-            "/no/a",
-            "/no/b",
-            "/api/hello/:name",
-        ];
-
-        for route in routes {
-            let res = tree.insert(route, route.to_owned());
-
-            if res.is_err() {
-                panic!("panic inserting route '{}': {:?}", route, res);
-            }
-        }
-
-        let tsr_routes = vec![
-            "/hi/",
-            "/b",
-            "/search/rustacean/",
-            "/cmd/vet",
-            "/src",
-            "/x/",
-            "/y",
-            "/0/go/",
-            "/1/go",
-            "/a",
-            "/admin/",
-            "/admin/config/",
-            "/admin/config/permissions/",
-            "/doc/",
-        ];
-
-        for route in tsr_routes {
-            let res = tree.at(route);
-
-            match res {
-                Ok(_) => {
-                    panic!("non-nil value for TSR route '{}'", route);
-                }
-                Err(err) => {
-                    if !err.tsr() {
-                        panic!("expected TSR recommendation for route '{}'", route);
-                    }
-                }
-            }
-        }
-
-        let no_tsr_routes = vec!["/", "/no", "/no/", "/_", "/_/", "/api/world/abc"];
-
-        for route in no_tsr_routes {
-            let res = tree.at(route);
-
-            match res {
-                Ok(_) => {
-                    panic!("non-nil value for TSR route '{}'", route);
-                }
-                Err(err) => {
-                    if err.tsr() {
-                        panic!("expected no TSR recommendation for route '{}'", route);
-                    }
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn test_tree_root_trailing_slash_redirect() {
-        let mut tree = Node::new();
-
-        tree.insert("/:test", "/:test".to_owned()).unwrap();
-
-        let res = tree.at("/");
-
-        match res {
-            Ok(_) => {
-                panic!("non-nil value for route '/'");
-            }
-            Err(err) => {
-                if err.tsr() {
-                    panic!("expected no TSR recommendation for route '/'");
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn test_tree_find_case_insensitive_path() {
-        let mut tree = Node::new();
-
-        let routes = vec![
-            "/hi",
-            "/b/",
-            "/ABC/",
-            "/search/:query",
-            "/cmd/:tool/",
-            "/src/*filepath",
-            "/x",
-            "/x/y",
-            "/y/",
-            "/y/z",
-            "/0/:id",
-            "/0/:id/1",
-            "/1/:id/",
-            "/1/:id/2",
-            "/aa",
-            "/a/",
-            "/doc",
-            "/doc/go_faq.html",
-            "/doc/go1.html",
-            "/doc/go/away",
-            "/no/a",
-            "/no/b",
-            "/Π",
-            "/u/apfêl/",
-            "/u/äpfêl/",
-            "/u/öpfêl",
-            "/v/Äpfêl/",
-            "/v/Öpfêl",
-            "/w/♬",
-            "/w/♭/",
-            "/w/𠜎",
-            "/w/𠜏/",
-            "/loooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooong",
-    ];
-
-        for route in &routes {
-            tree.insert(*route, route.to_owned()).unwrap();
-        }
-
-        // Check out == in for all registered routes
-        // With fixTrailingSlash = true
-        for route in &routes {
-            let out = tree.path_ignore_case(route, true);
-            match out {
-                None => panic!("Route '{}' not found!", route),
-                Some(out) => {
-                    if out != *route {
-                        panic!("Wrong result for route '{}': {}", route, out);
-                    }
-                }
-            };
-        }
-
-        // With fixTrailingSlash = false
-        for route in &routes {
-            let out = tree.path_ignore_case(route, false);
-            match out {
-                None => panic!("Route '{}' not found!", route),
-                Some(out) => {
-                    if out != *route {
-                        panic!("Wrong result for route '{}': {}", route, out);
-                    }
-                }
-            };
-        }
-
-        let tests = vec![
-            ("/HI", "/hi", false),
-            ("/HI/", "/hi", true),
-            ("/B", "/b/", true),
-            ("/B/", "/b/", false),
-            ("/abc", "/ABC/", true),
-            ("/abc/", "/ABC/", false),
-            ("/aBc", "/ABC/", true),
-            ("/aBc/", "/ABC/", false),
-            ("/abC", "/ABC/", true),
-            ("/abC/", "/ABC/", false),
-            ("/SEARCH/QUERY", "/search/QUERY", false),
-            ("/SEARCH/QUERY/", "/search/QUERY", true),
-            ("/CMD/TOOL/", "/cmd/TOOL/", false),
-            ("/CMD/TOOL", "/cmd/TOOL/", true),
-            ("/SRC/FILE/PATH", "/src/FILE/PATH", false),
-            ("/x/Y", "/x/y", false),
-            ("/x/Y/", "/x/y", true),
-            ("/X/y", "/x/y", false),
-            ("/X/y/", "/x/y", true),
-            ("/X/Y", "/x/y", false),
-            ("/X/Y/", "/x/y", true),
-            ("/Y/", "/y/", false),
-            ("/Y", "/y/", true),
-            ("/Y/z", "/y/z", false),
-            ("/Y/z/", "/y/z", true),
-            ("/Y/Z", "/y/z", false),
-            ("/Y/Z/", "/y/z", true),
-            ("/y/Z", "/y/z", false),
-            ("/y/Z/", "/y/z", true),
-            ("/Aa", "/aa", false),
-            ("/Aa/", "/aa", true),
-            ("/AA", "/aa", false),
-            ("/AA/", "/aa", true),
-            ("/aA", "/aa", false),
-            ("/aA/", "/aa", true),
-            ("/A/", "/a/", false),
-            ("/A", "/a/", true),
-            ("/DOC", "/doc", false),
-            ("/DOC/", "/doc", true),
-            ("/NO", "", true),
-            ("/DOC/GO", "", true),
-            // [TODO] unicode vs ascii case sensitivity
-            // ("/π", "/Π", false),
-            // ("/π/", "/Π", true),
-            // ("/u/ÄPFÊL/", "/u/äpfêl/", false),
-            // ("/u/ÄPFÊL", "/u/äpfêl/", true),
-            // ("/u/ÖPFÊL/", "/u/öpfêl", true),
-            // ("/u/ÖPFÊL", "/u/öpfêl", false),
-            // ("/v/äpfêL/", "/v/Äpfêl/", false),
-            // ("/v/äpfêL", "/v/Äpfêl/", true),
-            // ("/v/öpfêL/", "/v/Öpfêl", true),
-            // ("/v/öpfêL", "/v/Öpfêl", false),
-            ("/w/♬/", "/w/♬", true),
-            ("/w/♭", "/w/♭/", true),
-            ("/w/𠜎/", "/w/𠜎", true),
-            ("/w/𠜏", "/w/𠜏/", true),
-            (
-                "/lOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOng/",
-                "/loooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooong",
-                true
-            ),
-    ];
-
-        struct Test {
-            inn: &'static str,
-            out: &'static str,
-            slash: bool,
-        }
-
-        let tests: Vec<Test> = tests
-            .into_iter()
-            .map(|test| Test {
-                inn: test.0,
-                out: test.1,
-                slash: test.2,
-            })
-            .collect();
-
-        // With fixTrailingSlash = true
-        for test in &tests {
-            let res = tree.path_ignore_case(test.inn, true).unwrap_or_default();
-            if res != test.out {
-                panic!("Wrong result for route '{}': {}", res, test.out);
-            }
-        }
-
-        // without fix trailing slash = false
-        for test in &tests {
-            let res = tree.path_ignore_case(test.inn, false);
-            match res {
-                None => (),
-                Some(res) => {
-                    if test.slash {
-                        // test needs a trailing slash fix. It must not be found!
-                        panic!(
-                            "Found without fix_trailing_slash: {}; got {}",
-                            test.inn, res
-                        );
-                    }
-                    if res != test.out {
-                        panic!("Wrong result for route '{}': {}", res, test.out);
-                    }
-                }
-            };
-        }
-    }
-
-    #[test]
-    fn test_tree_wildcard_conflict_ex() {
-        let conflicts = vec![
-            ("/who/are/foo", "/who/are/*you"),
-            ("/who/are/foo/", "/who/are/*you"),
-            ("/who/are/foo/bar", "/who/are/*you"),
-            ("/con:nection", "/con:tact"),
-            ("/whose/:users/:user", "/whose/:users/:name"),
-        ];
-
-        for conflict in conflicts {
-            let mut tree = Node::new();
-
-            let routes = vec![
-                "/con:tact",
-                "/who/are/*you",
-                "/who/foo/hello",
-                "/whose/:users/:name",
-            ];
-
-            for route in routes {
-                tree.insert(route, route.to_owned()).unwrap();
-            }
-
-            let res = tree.insert(conflict.0, conflict.0.to_owned());
-            assert_eq!(
-                res,
-                Err(InsertError::Conflict {
-                    with: conflict.1.into()
-                })
-            );
-        }
-    }
-
-    #[test]
-    fn malformed_path() {
-        let mut tree = Node::new();
-        assert_eq!(tree.insert("*x", 1), Err(InsertError::MalformedPath));
-    }
 }
