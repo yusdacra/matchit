@@ -3,6 +3,7 @@ use crate::{InsertError, MatchError, Params};
 use std::cell::UnsafeCell;
 use std::cmp::min;
 use std::mem;
+use std::ops::{Deref, DerefMut};
 use std::str;
 
 /// A successful match consisting of the registered value and the URL parameters, returned by
@@ -28,6 +29,121 @@ enum NodeType {
     Static,
 }
 
+#[derive(Clone)]
+pub struct Root<T> {
+    node: Node<T>,
+    paths: Vec<(String, *const UnsafeCell<T>)>,
+}
+
+impl<T> Default for Root<T> {
+    fn default() -> Self {
+        Self {
+            node: Node::default(),
+            paths: Vec::new(),
+        }
+    }
+}
+
+impl<T> Root<T> {
+    /// Construct a new `Root`.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Register a value in the tree under the given route.
+    ///
+    /// ```rust
+    /// # use matchit::Root;
+    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// let mut matcher = Root::new();
+    /// matcher.insert("/home", "Welcome!")?;
+    /// matcher.insert("/users/:id", "A User")?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn insert(&mut self, path: impl Into<String>, value: T) -> Result<(), InsertError> {
+        let path = path.into();
+        // this ensures that the stored pointer is initialized
+        let cell_ref = self.deref_mut().insert_inner(path.clone(), value)?;
+        let cell_pointer: *const UnsafeCell<T> = cell_ref;
+        self.paths.push((path, cell_pointer));
+        Ok(())
+    }
+
+    /// Get the routes contained in the tree along with an immutable reference
+    /// to it's respective value.
+    ///
+    /// ```rust
+    /// # use matchit::Root;
+    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// let mut matcher = Root::new();
+    /// matcher.insert("/home", "Welcome!")?;
+    /// matcher.insert("/users/:id", "A User")?;
+    /// for (path, value) in matcher.routes() {
+    ///     // println!("route '{}': {}", path, value);
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn routes(&self) -> impl Iterator<Item = (&str, &T)> {
+        // SAFETY: this is safe because we take a &self
+        self.routes_inner()
+            .map(|(path, value)| (path, unsafe { &*value }))
+    }
+
+    /// Get the routes contained in the tree along with a mutable reference
+    /// to it's respective value.
+    ///
+    /// ```rust
+    /// # use matchit::Root;
+    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// let mut matcher = Root::new();
+    /// matcher.insert("/home", "Welcome!")?;
+    /// matcher.insert("/users/:id", "A User".to_string())?;
+    /// for (path, value) in unsafe { matcher.routes_mut() } {
+    ///     *value = "asdf".to_string();
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn routes_mut(&mut self) -> impl Iterator<Item = (&str, &mut T)> {
+        // SAFETY: this is safe because we take a &mut self
+        self.routes_inner()
+            .map(|(path, value)| (path, unsafe { &mut *value }))
+    }
+
+    // This is needed to abstract over mutability.
+    //
+    // Out stored UnsafeCell's need to be wrapped in a Box in order to
+    // be able to safely expose them. Otherwise assigning a value to the
+    // generated mutable references will cause UB.
+    fn routes_inner(&self) -> impl Iterator<Item = (&str, *mut T)> {
+        self.paths.iter().map(move |(path, value)| {
+            // SAFETY: this is safe because
+            // - lifetimes are bound to &self, which is correct
+            // - the pointer will always be initialized, because we cast a reference to a pointer
+            // in `insert`
+            // - the pointer cannot be null because we don't drop it or move it (if it's dropped, it means
+            // self is also dropped, due to lifetimes being bound to self and that node is stored in self)
+            (path.as_str(), UnsafeCell::raw_get(*value))
+        })
+    }
+}
+
+impl<T> Deref for Root<T> {
+    type Target = Node<T>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.node
+    }
+}
+
+impl<T> DerefMut for Root<T> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.node
+    }
+}
+
 /// A radix tree used for URL path matching.
 ///
 /// See [the crate documentation](crate) for details.
@@ -37,7 +153,8 @@ pub struct Node<T> {
     indices: Vec<u8>,
     node_type: NodeType,
     // See `at_inner` for why an unsafe cell is needed.
-    value: Option<UnsafeCell<T>>,
+    // See `Root::routes_inner` for why Box is needed.
+    value: Option<Box<UnsafeCell<T>>>,
     pub(crate) prefix: Vec<u8>,
     pub(crate) children: Vec<Self>,
 }
@@ -61,7 +178,7 @@ where
             value: self
                 .value
                 .as_ref()
-                .map(|val| UnsafeCell::new(unsafe { &*val.get() }.clone())),
+                .map(|val| Box::new(UnsafeCell::new(unsafe { &*val.get() }.clone()))),
             priority: self.priority,
         }
     }
@@ -98,6 +215,14 @@ impl<T> Node<T> {
     /// # }
     /// ```
     pub fn insert(&mut self, route: impl Into<String>, val: T) -> Result<(), InsertError> {
+        self.insert_inner(route, val).map(|_| ())
+    }
+
+    fn insert_inner(
+        &mut self,
+        route: impl Into<String>,
+        val: T,
+    ) -> Result<&UnsafeCell<T>, InsertError> {
         let route = route.into().into_bytes();
         let mut prefix = route.as_ref();
 
@@ -105,9 +230,9 @@ impl<T> Node<T> {
 
         // Empty tree
         if self.prefix.is_empty() && self.children.is_empty() {
-            self.insert_child(&prefix, &route, val)?;
             self.node_type = NodeType::Root;
-            return Ok(());
+            let cell_ref = self.insert_child(&prefix, &route, val)?;
+            return Ok(cell_ref);
         }
 
         let mut current = self;
@@ -201,9 +326,9 @@ impl<T> Node<T> {
                 return Err(InsertError::conflict(&route, &prefix, &current));
             }
 
-            current.value = Some(UnsafeCell::new(val));
+            current.value = Some(Box::new(UnsafeCell::new(val)));
 
-            return Ok(());
+            return Ok(current.value.as_ref().unwrap());
         }
     }
 
@@ -248,16 +373,21 @@ impl<T> Node<T> {
         new_pos
     }
 
-    fn insert_child(&mut self, mut prefix: &[u8], route: &[u8], val: T) -> Result<(), InsertError> {
+    fn insert_child(
+        &mut self,
+        mut prefix: &[u8],
+        route: &[u8],
+        val: T,
+    ) -> Result<&UnsafeCell<T>, InsertError> {
         let mut current = self;
 
         loop {
             let (wildcard, wildcard_index, valid) = find_wildcard(&prefix);
 
             if wildcard_index.is_none() {
-                current.value = Some(UnsafeCell::new(val));
+                current.value = Some(Box::new(UnsafeCell::new(val)));
                 current.prefix = prefix.to_owned();
-                return Ok(());
+                return Ok(current.value.as_ref().unwrap());
             };
 
             let mut wildcard_index = wildcard_index.unwrap();
@@ -307,8 +437,8 @@ impl<T> Node<T> {
                 }
 
                 // Otherwise we're done. Insert the value in the new leaf
-                current.value = Some(UnsafeCell::new(val));
-                return Ok(());
+                current.value = Some(Box::new(UnsafeCell::new(val)));
+                return Ok(current.value.as_ref().unwrap());
             }
 
             // catch all
@@ -347,14 +477,14 @@ impl<T> Node<T> {
             let child = Self {
                 prefix: prefix[wildcard_index..].to_owned(),
                 node_type: NodeType::CatchAll,
-                value: Some(UnsafeCell::new(val)),
+                value: Some(Box::new(UnsafeCell::new(val))),
                 priority: 1,
                 ..Self::default()
             };
 
             current.children = vec![child];
 
-            return Ok(());
+            return Ok(current.children[0].value.as_ref().unwrap());
         }
     }
 
@@ -904,4 +1034,76 @@ fn find_wildcard(path: &[u8]) -> (Option<&[u8]>, Option<usize>, bool) {
         return (Some(&path[start..]), Some(start), valid);
     }
     (None, None, false)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Root;
+
+    #[test]
+    fn test_tree_routes() {
+        let mut tree = Root::new();
+
+        let routes = [
+            ("/test", "a"),
+            ("/test2", "b"),
+            ("/test/sub", "c"),
+            ("/test2/sub", "d"),
+        ];
+
+        for (path, value) in routes {
+            tree.insert(path, value).unwrap();
+        }
+
+        let new_routes = tree.routes().collect::<Vec<_>>();
+
+        let are_routes_correct = routes.iter().all(|(p, v)| {
+            new_routes
+                .iter()
+                .find(|(op, _)| p == op)
+                .map_or(false, |(_, ov)| v == *ov)
+        });
+
+        assert!(are_routes_correct);
+    }
+
+    #[test]
+    fn test_tree_routes_mut() {
+        let mut tree = Root::new();
+
+        let routes = [
+            ("/test", "a"),
+            ("/test2", "b"),
+            ("/test/sub", "c"),
+            ("/test2/sub", "d"),
+        ];
+
+        for (path, value) in routes {
+            tree.insert(path, value.to_string()).unwrap();
+        }
+
+        let replace_with = [
+            ("/test", "hello"),
+            ("/test2", "world"),
+            ("/test/sub", "!"),
+            ("/test2/sub", "?"),
+        ];
+
+        for (path, value) in tree.routes_mut() {
+            if let Some((_, replace_value)) = replace_with.iter().find(|(op, _)| path == *op) {
+                *value = replace_value.to_string();
+            }
+        }
+
+        let new_routes = tree.routes().collect::<Vec<_>>();
+
+        let replaced_correctly = replace_with.iter().all(|(p, v)| {
+            new_routes
+                .iter()
+                .find(|(op, _)| p == op)
+                .map_or(false, |(_, ov)| v == ov)
+        });
+
+        assert!(replaced_correctly);
+    }
 }

@@ -127,7 +127,7 @@ mod tree;
 
 pub use error::{InsertError, MatchError};
 pub use params::{Params, ParamsIter};
-pub use tree::{Match, Node};
+pub use tree::{Match, Node, Root};
 
 #[cfg(doctest)]
 mod test_readme {
